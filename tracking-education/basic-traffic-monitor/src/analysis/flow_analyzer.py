@@ -1,6 +1,6 @@
 """
 Traffic flow analyzer for analyzing vehicle movement patterns and traffic density.
-Provides traffic flow visualization and analysis functionality.
+Provides traffic flow visualization and analysis functionality with traffic light optimization support.
 """
 
 import time
@@ -53,6 +53,8 @@ class TrafficFlow:
     avg_speed: float
     dominant_direction: FlowDirection
     directional_counts: Dict[FlowDirection, int]
+    queue_length: float = 0.0  # Estimated queue length for traffic light control
+    wait_time: float = 0.0     # Estimated average wait time
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary representation."""
@@ -63,8 +65,43 @@ class TrafficFlow:
             'vehicle_count': self.vehicle_count,
             'avg_speed': self.avg_speed,
             'dominant_direction': self.dominant_direction.name,
-            'directional_counts': {d.name: c for d, c in self.directional_counts.items()}
+            'directional_counts': {d.name: c for d, c in self.directional_counts.items()},
+            'queue_length': self.queue_length,
+            'wait_time': self.wait_time
         }
+    
+    def get_traffic_light_data(self) -> Dict[str, Any]:
+        """Format data for traffic light controller."""
+        return {
+            'region_id': self.region_id,
+            'density_level': self.density.name,
+            'vehicle_count': self.vehicle_count,
+            'avg_speed': self.avg_speed,
+            'dominant_direction': self.dominant_direction.name,
+            'queue_length': self.queue_length,
+            'wait_time': self.wait_time,
+            'congestion': self._calculate_congestion_level(),
+            'flow_rate': self._calculate_flow_rate()
+        }
+    
+    def _calculate_congestion_level(self) -> float:
+        """Calculate normalized congestion level (0-1)."""
+        # Map density levels to congestion values
+        density_map = {
+            TrafficDensity.VERY_LOW: 0.0,
+            TrafficDensity.LOW: 0.2,
+            TrafficDensity.MODERATE: 0.4,
+            TrafficDensity.HIGH: 0.6,
+            TrafficDensity.VERY_HIGH: 0.8,
+            TrafficDensity.CONGESTED: 1.0
+        }
+        
+        return density_map.get(self.density, 0.0)
+    
+    def _calculate_flow_rate(self) -> float:
+        """Calculate flow rate in vehicles per hour."""
+        # Simple calculation assuming vehicle_count is for a 5-minute window
+        return self.vehicle_count * 12  # Convert to hourly rate
 
 
 class FlowAnalyzer:
@@ -82,7 +119,9 @@ class FlowAnalyzer:
         update_interval: int = 30,
         use_speed_data: bool = True,
         store_history: bool = True,
-        max_history_items: int = 1000
+        max_history_items: int = 1000,
+        calculate_queue_length: bool = True,    # Enable queue length estimation for traffic lights
+        traffic_light_optimization: bool = True  # Enable traffic light optimization features
     ):
         """
         Initialize flow analyzer.
@@ -97,6 +136,8 @@ class FlowAnalyzer:
             use_speed_data: Whether to use speed data in flow analysis
             store_history: Whether to store flow history
             max_history_items: Maximum flow history items to store
+            calculate_queue_length: Whether to calculate queue length for traffic light control
+            traffic_light_optimization: Whether to enable traffic light optimization features
         """
         self.frame_size = frame_size
         self.flow_history_length = flow_history_length
@@ -104,6 +145,8 @@ class FlowAnalyzer:
         self.use_speed_data = use_speed_data
         self.store_history = store_history
         self.max_history_items = max_history_items
+        self.calculate_queue_length = calculate_queue_length
+        self.traffic_light_optimization = traffic_light_optimization
         
         # Set default density thresholds if not provided
         if density_thresholds is None:
@@ -140,7 +183,13 @@ class FlowAnalyzer:
                 'vehicle_speeds': {},     # frame_index -> avg speed
                 'flow_directions': {},    # frame_index -> Dict[FlowDirection, count]
                 'current_vehicles': set(),  # Set of currently tracked vehicle IDs
-                'last_flow': None         # Last calculated TrafficFlow object
+                'stationary_vehicles': {},  # vehicle_id -> stationary time
+                'last_flow': None,        # Last calculated TrafficFlow object
+                'queue_data': {           # Data for queue estimation
+                    'stopped_vehicles': {},  # vehicle_id -> stop duration
+                    'queue_length': 0.0,     # Estimated queue length in vehicles
+                    'max_wait_time': 0.0     # Maximum wait time in seconds
+                }
             }
         
         # Create density maps
@@ -153,6 +202,9 @@ class FlowAnalyzer:
         # Statistics
         self.frames_processed = 0
         self.flow_updates = 0
+        
+        # Traffic light data
+        self.traffic_light_data = {}  # region_id -> traffic light data
         
         # Create lock for thread safety
         self.lock = threading.Lock()
@@ -399,6 +451,10 @@ class FlowAnalyzer:
                         # Add to current vehicles in region
                         vehicles_in_region.append((vehicle_id, direction, speed))
                         region_data['current_vehicles'].add(vehicle_id)
+                        
+                        # Update queue estimation for traffic light control
+                        if self.calculate_queue_length:
+                            self._update_queue_data(region_id, vehicle_id, speed, frame_index)
                 
                 # Update vehicle count for this frame
                 region_data['vehicle_counts'][frame_index] = len(vehicles_in_region)
@@ -448,12 +504,48 @@ class FlowAnalyzer:
                     if flow:
                         updated_flows[region_id] = flow
                         self.flow_updates += 1
+                        
+                        # Update traffic light data
+                        if self.traffic_light_optimization:
+                            self.traffic_light_data[region_id] = flow.get_traffic_light_data()
             
             # Update density and flow maps
             self._update_density_map(valid_detections)
             self._update_flow_map(valid_detections, speeds)
         
         return updated_flows
+    
+    def _update_queue_data(self, region_id: str, vehicle_id: int, speed: float, frame_index: int):
+        """
+        Update queue data for traffic light estimation.
+        
+        Args:
+            region_id: Region identifier
+            vehicle_id: Vehicle identifier
+            speed: Vehicle speed
+            frame_index: Current frame index
+        """
+        queue_data = self.region_data[region_id]['queue_data']
+        stopped_vehicles = queue_data['stopped_vehicles']
+        
+        # Vehicle is considered stopped if speed is below threshold
+        if speed < 5.0:  # 5 km/h threshold
+            # If vehicle not already marked as stopped, add it
+            if vehicle_id not in stopped_vehicles:
+                stopped_vehicles[vehicle_id] = 0.0
+            else:
+                # Update duration (assuming 30 fps)
+                stopped_vehicles[vehicle_id] += 1.0 / 30.0  # Convert frames to seconds
+                
+                # Update max wait time
+                queue_data['max_wait_time'] = max(queue_data['max_wait_time'], stopped_vehicles[vehicle_id])
+        else:
+            # Vehicle is moving, remove from stopped list
+            if vehicle_id in stopped_vehicles:
+                del stopped_vehicles[vehicle_id]
+        
+        # Calculate queue length
+        queue_data['queue_length'] = len(stopped_vehicles)
     
     def _calculate_region_flow(self, region_id: str) -> Optional[TrafficFlow]:
         """
@@ -496,6 +588,15 @@ class FlowAnalyzer:
         # Determine density level
         density_level = self._get_density_level(avg_count, region_area)
         
+        # Get queue data for traffic light control
+        queue_length = 0.0
+        wait_time = 0.0
+        
+        if self.calculate_queue_length:
+            queue_data = region_data['queue_data']
+            queue_length = queue_data['queue_length']
+            wait_time = queue_data['max_wait_time']
+        
         # Create flow object
         flow = TrafficFlow(
             region_id=region_id,
@@ -504,7 +605,9 @@ class FlowAnalyzer:
             vehicle_count=int(avg_count),
             avg_speed=avg_speed,
             dominant_direction=dominant_direction,
-            directional_counts=combined_direction_counts
+            directional_counts=combined_direction_counts,
+            queue_length=queue_length,
+            wait_time=wait_time
         )
         
         return flow
@@ -625,6 +728,93 @@ class FlowAnalyzer:
                         flows[rid] = data['last_flow']
                 return flows if flows else None
     
+    def get_traffic_light_data(self, region_id: Optional[str] = None) -> Union[Dict[str, Any], Dict[str, Dict[str, Any]], None]:
+        """
+        Get formatted traffic light data for a region or all regions.
+        
+        Args:
+            region_id: Optional region identifier
+        
+        Returns:
+            Dictionary of traffic light data for a region, dictionary of region_id -> data, or None
+        """
+        with self.lock:
+            if not self.traffic_light_optimization:
+                return None
+                
+            if region_id:
+                if region_id not in self.traffic_light_data:
+                    return None
+                return self.traffic_light_data[region_id]
+            else:
+                # Return all regions
+                return self.traffic_light_data.copy() if self.traffic_light_data else None
+    
+    def get_signal_optimization_data(self, region_id: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Get data formatted for traffic signal optimization.
+        
+        Args:
+            region_id: Optional region identifier to filter by
+        
+        Returns:
+            Dictionary with data formatted for signal optimizer
+        """
+        if not self.traffic_light_optimization:
+            return {'error': 'Traffic light optimization not enabled'}
+        
+        flows = self.get_current_flow(region_id)
+        if not flows:
+            return {'error': 'No flow data available'}
+        
+        # Format for signal optimization
+        optimization_data = {}
+        
+        # If flows is a single TrafficFlow object
+        if isinstance(flows, TrafficFlow):
+            flows = {flows.region_id: flows}
+        
+        for region_id, flow in flows.items():
+            # Create movement data
+            movement_id = f"movement_{region_id}"
+            
+            # Calculate hourly flow rate
+            flow_rate = flow.vehicle_count * 12  # Assuming 5-minute count, convert to hourly
+            
+            # Estimate saturation flow based on density
+            # Higher density = lower saturation flow
+            base_saturation = 1800  # Base saturation flow per lane
+            density_factor = 1.0
+            
+            if flow.density == TrafficDensity.MODERATE:
+                density_factor = 0.9
+            elif flow.density == TrafficDensity.HIGH:
+                density_factor = 0.8
+            elif flow.density == TrafficDensity.VERY_HIGH:
+                density_factor = 0.7
+            elif flow.density == TrafficDensity.CONGESTED:
+                density_factor = 0.6
+            
+            saturation_flow = base_saturation * density_factor
+            
+            # Create movement data
+            optimization_data[movement_id] = {
+                'id': movement_id,
+                'region_id': region_id,
+                'flow_rate': flow_rate,
+                'queue_length': flow.queue_length,
+                'saturation_flow': saturation_flow,
+                'density': flow.density.name,
+                'direction': flow.dominant_direction.name,
+                'avg_speed': flow.avg_speed,
+                'wait_time': flow.wait_time
+            }
+        
+        return {
+            'movements': optimization_data,
+            'timestamp': time.time()
+        }
+    
     def get_flow_history(self, region_id: Optional[str] = None,
                         max_items: Optional[int] = None,
                         time_period: Optional[Tuple[float, float]] = None) -> List[TrafficFlow]:
@@ -698,7 +888,8 @@ class FlowAnalyzer:
                 'frames_processed': self.frames_processed,
                 'flow_updates': self.flow_updates,
                 'history_enabled': self.store_history,
-                'history_items': len(self.history) if self.store_history else 0
+                'history_items': len(self.history) if self.store_history else 0,
+                'traffic_light_optimization': self.traffic_light_optimization
             }
     
     def reset(self):
@@ -712,7 +903,12 @@ class FlowAnalyzer:
                     'vehicle_speeds': {},
                     'flow_directions': {},
                     'current_vehicles': set(),
-                    'last_flow': None
+                    'last_flow': None,
+                    'queue_data': {
+                        'stopped_vehicles': {},
+                        'queue_length': 0.0,
+                        'max_wait_time': 0.0
+                    }
                 }
             
             # Reset maps
@@ -726,6 +922,9 @@ class FlowAnalyzer:
             # Reset statistics
             self.frames_processed = 0
             self.flow_updates = 0
+            
+            # Reset traffic light data
+            self.traffic_light_data = {}
             
             logger.info("Flow analyzer reset")
     
@@ -757,7 +956,12 @@ class FlowAnalyzer:
                         'vehicle_speeds': {},
                         'flow_directions': {},
                         'current_vehicles': set(),
-                        'last_flow': None
+                        'last_flow': None,
+                        'queue_data': {
+                            'stopped_vehicles': {},
+                            'queue_length': 0.0,
+                            'max_wait_time': 0.0
+                        }
                     }
             
             logger.info(f"Updated regions: now using {len(self.regions)} regions")
@@ -881,9 +1085,97 @@ class FlowAnalyzer:
                     label = region_id
                     if flow_data:
                         label += f": {flow_data.vehicle_count} vehicles"
+                        
+                        # Add queue info if available
+                        if hasattr(flow_data, 'queue_length') and flow_data.queue_length > 0:
+                            label += f", Queue: {int(flow_data.queue_length)}"
                     
                     # Draw label
                     cv2.putText(output, label, (center_x, center_y), 
                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
         
         return output
+    
+    def generate_traffic_light_report(self) -> Dict[str, Any]:
+        """
+        Generate a comprehensive report for traffic light management.
+        
+        Returns:
+            Dictionary with traffic flow report data
+        """
+        if not self.traffic_light_optimization:
+            return {'error': 'Traffic light optimization not enabled'}
+        
+        with self.lock:
+            # Get current flows
+            current_flows = {}
+            for region_id, data in self.region_data.items():
+                if data['last_flow']:
+                    current_flows[region_id] = data['last_flow']
+            
+            if not current_flows:
+                return {'error': 'No flow data available'}
+            
+            # Calculate summary statistics
+            total_vehicles = sum(flow.vehicle_count for flow in current_flows.values())
+            avg_speed = sum(flow.avg_speed for flow in current_flows.values()) / len(current_flows) if current_flows else 0
+            
+            # Determine overall traffic status
+            congestion_levels = [flow.density for flow in current_flows.values()]
+            highest_congestion = max(congestion_levels, key=lambda x: x.value)
+            
+            # Calculate queue statistics
+            total_queue = sum(flow.queue_length for flow in current_flows.values())
+            max_wait = max((flow.wait_time for flow in current_flows.values()), default=0)
+            
+            # Format data for each region
+            region_data = {}
+            for region_id, flow in current_flows.items():
+                region_data[region_id] = {
+                    'vehicle_count': flow.vehicle_count,
+                    'density': flow.density.name,
+                    'dominant_direction': flow.dominant_direction.name,
+                    'avg_speed': flow.avg_speed,
+                    'queue_length': flow.queue_length,
+                    'wait_time': flow.wait_time
+                }
+            
+            # Create report
+            return {
+                'timestamp': time.time(),
+                'summary': {
+                    'total_vehicles': total_vehicles,
+                    'avg_speed': avg_speed,
+                    'congestion_level': highest_congestion.name,
+                    'total_queue': total_queue,
+                    'max_wait_time': max_wait
+                },
+                'regions': region_data,
+                'recommended_action': self._get_traffic_recommendation(highest_congestion)
+            }
+    
+    def _get_traffic_recommendation(self, congestion_level: TrafficDensity) -> str:
+        """
+        Get traffic management recommendation based on congestion level.
+        
+        Args:
+            congestion_level: Current congestion level
+        
+        Returns:
+            Recommendation string
+        """
+        if congestion_level == TrafficDensity.VERY_LOW:
+            return "Maintain standard signal timing"
+        elif congestion_level == TrafficDensity.LOW:
+            return "Maintain standard signal timing"
+        elif congestion_level == TrafficDensity.MODERATE:
+            return "Consider minor adjustments to green time allocation"
+        elif congestion_level == TrafficDensity.HIGH:
+            return "Increase green time for congested approaches"
+        elif congestion_level == TrafficDensity.VERY_HIGH:
+            return "Implement adaptive signal timing with extended green time for main approaches"
+        elif congestion_level == TrafficDensity.CONGESTED:
+            return "Activate congestion management plan with extended cycle length and coordination"
+        else:
+            return "Maintain standard signal timing"
+
