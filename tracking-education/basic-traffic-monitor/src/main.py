@@ -1,6 +1,3 @@
-#!/usr/bin/env python
-# -*- coding: utf-8 -*-
-
 """
 Main entry point for the Traffic Monitoring System.
 Initializes all components, starts processing pipeline, and handles program lifecycle.
@@ -45,6 +42,15 @@ from visualization.traffic_report import ReportGenerator, ReportType, ChartType
 from database.db_connect import init_db_connection, ConnectionParams
 from database.data_models import init_database
 
+# Import new traffic management components
+from management.traffic_light_controller import TrafficLightController, SignalState, SignalTiming, SignalPlan
+from management.signal_optimizer import (
+    SignalOptimizer, FixedTimeOptimizer, AdaptiveOptimizer, 
+    PredictiveOptimizer, CoordinationOptimizer
+)
+from management.intersection_manager import IntersectionManager, Intersection, Lane, LaneDirection
+from management.simulation_model import SimulationModel, TrafficStats
+
 class TrafficMonitoringSystem:
     """Main class for the Traffic Monitoring System."""
 
@@ -70,6 +76,12 @@ class TrafficMonitoringSystem:
         self.display_manager = None
         self.db_connection = None
         
+        # Traffic Management components
+        self.traffic_controllers = {}
+        self.signal_optimizers = {}
+        self.intersection_manager = None
+        self.simulation_model = None
+        
         # Load configuration
         self.load_configuration()
         
@@ -91,6 +103,19 @@ class TrafficMonitoringSystem:
             system_settings_path = os.path.join(self.config_path, "system_settings.json")
             with open(system_settings_path, 'r') as f:
                 self.system_settings = json.load(f)
+                
+            # Load traffic management configuration if available
+            traffic_management_path = os.path.join(self.config_path, "traffic_management.json")
+            if os.path.exists(traffic_management_path):
+                with open(traffic_management_path, 'r') as f:
+                    self.traffic_management_config = json.load(f)
+            else:
+                # Create default traffic management config
+                self.traffic_management_config = {
+                    "enabled": True,
+                    "intersections": [],
+                    "optimization_mode": "adaptive"
+                }
                 
             logger.info("Configuration loaded successfully")
             
@@ -118,6 +143,9 @@ class TrafficMonitoringSystem:
             
             # Initialize analysis components
             self.initialize_analysis()
+            
+            # Initialize traffic management components
+            self.initialize_traffic_management()
             
             # Initialize visualization
             self.initialize_visualization()
@@ -379,6 +407,130 @@ class TrafficMonitoringSystem:
             except Exception as e:
                 logger.error(f"Failed to initialize analysis for camera {camera_id}: {str(e)}")
     
+    def initialize_traffic_management(self):
+        """Initialize traffic management components."""
+        if not self.traffic_management_config.get('enabled', False):
+            logger.info("Traffic management disabled in configuration")
+            return
+            
+        try:
+            # Initialize traffic light controllers for each intersection
+            for intersection_config in self.traffic_management_config.get('intersections', []):
+                intersection_id = intersection_config.get('id')
+                if not intersection_id:
+                    continue
+                
+                logger.info(f"Initializing traffic light controller for intersection {intersection_id}")
+                
+                # Initialize signals
+                signals = {}
+                for signal_config in intersection_config.get('signals', []):
+                    signal_id = signal_config.get('id')
+                    initial_state = SignalState[signal_config.get('initial_state', 'RED')]
+                    signals[signal_id] = initial_state
+                
+                # Initialize timing parameters
+                timing_params = intersection_config.get('timing_params', {
+                    'min_green_time': 10.0,
+                    'max_green_time': 60.0,
+                    'yellow_time': 4.0,
+                    'all_red_time': 2.0,
+                    'pedestrian_time': 15.0,
+                    'extension_time': 2.0,
+                    'gap_time': 3.0
+                })
+                
+                # Initialize signal plans
+                plans = intersection_config.get('plans', [])
+                
+                # Initialize controller
+                controller = TrafficLightController(
+                    intersection_id=intersection_id,
+                    signals=signals,
+                    timing_params=timing_params,
+                    plans=plans,
+                    optimization_mode=intersection_config.get('optimization_mode', 'fixed'),
+                    coordination_enabled=intersection_config.get('coordination_enabled', False),
+                    emergency_mode_enabled=intersection_config.get('emergency_mode_enabled', True),
+                    fail_safe_mode=intersection_config.get('fail_safe_mode', 'flashing_red'),
+                    startup_sequence=intersection_config.get('startup_sequence', 'all_red')
+                )
+                
+                self.traffic_controllers[intersection_id] = controller
+                
+                # Initialize signal optimizer
+                optimizer_type = intersection_config.get('optimizer_type', 'adaptive')
+                optimization_settings = intersection_config.get('optimization_settings', {})
+                
+                if optimizer_type == 'fixed':
+                    optimizer = FixedTimeOptimizer(
+                        min_cycle=optimization_settings.get('min_cycle', 30.0),
+                        max_cycle=optimization_settings.get('max_cycle', 120.0),
+                        lost_time_per_phase=optimization_settings.get('lost_time_per_phase', 4.0),
+                        update_interval=optimization_settings.get('update_interval', 1800.0)
+                    )
+                elif optimizer_type == 'adaptive':
+                    optimizer = AdaptiveOptimizer(
+                        min_cycle=optimization_settings.get('min_cycle', 30.0),
+                        max_cycle=optimization_settings.get('max_cycle', 150.0),
+                        adaptation_rate=optimization_settings.get('adaptation_rate', 0.3),
+                        queue_weight=optimization_settings.get('queue_weight', 0.5)
+                    )
+                elif optimizer_type == 'predictive':
+                    optimizer = PredictiveOptimizer(
+                        min_cycle=optimization_settings.get('min_cycle', 30.0),
+                        max_cycle=optimization_settings.get('max_cycle', 150.0),
+                        prediction_horizon=optimization_settings.get('prediction_horizon', 3),
+                        prediction_weight=optimization_settings.get('prediction_weight', 0.5)
+                    )
+                elif optimizer_type == 'coordination':
+                    optimizer = CoordinationOptimizer(
+                        min_cycle=optimization_settings.get('min_cycle', 60.0),
+                        max_cycle=optimization_settings.get('max_cycle', 180.0),
+                        coordination_speed=optimization_settings.get('coordination_speed', 40.0),
+                        coordination_type=optimization_settings.get('coordination_type', 'two_way')
+                    )
+                    
+                    # Set network information if available
+                    if 'network_info' in intersection_config:
+                        network = intersection_config['network_info']
+                        optimizer.set_network_information(
+                            upstream=network.get('upstream', []),
+                            downstream=network.get('downstream', []),
+                            distances_upstream=network.get('distances_upstream', {}),
+                            distances_downstream=network.get('distances_downstream', {})
+                        )
+                else:
+                    # Default to adaptive
+                    optimizer = AdaptiveOptimizer()
+                
+                self.signal_optimizers[intersection_id] = optimizer
+                
+                logger.info(f"Traffic light controller and optimizer initialized for intersection {intersection_id}")
+            
+            # Initialize intersection manager if multiple intersections
+            if len(self.traffic_controllers) > 1:
+                self.intersection_manager = IntersectionManager(
+                    intersections=list(self.traffic_controllers.keys()),
+                    controllers=self.traffic_controllers
+                )
+                logger.info(f"Intersection manager initialized with {len(self.traffic_controllers)} intersections")
+            
+            # Initialize simulation model if enabled
+            if self.traffic_management_config.get('simulation', {}).get('enabled', False):
+                simulation_config = self.traffic_management_config.get('simulation', {})
+                self.simulation_model = SimulationModel(
+                    controllers=self.traffic_controllers,
+                    use_real_data=not simulation_config.get('virtual_traffic', False),
+                    simulation_speed=simulation_config.get('simulation_speed', 1.0)
+                )
+                logger.info("Traffic simulation model initialized")
+            
+            logger.info("Traffic management components initialized successfully")
+            
+        except Exception as e:
+            logger.error(f"Failed to initialize traffic management: {str(e)}")
+    
     def initialize_visualization(self):
         """Initialize visualization components."""
         vis_settings = self.system_settings.get('visualization', {})
@@ -393,6 +545,7 @@ class TrafficMonitoringSystem:
                 show_speed=vis_settings.get('display', {}).get('show_speed', True),
                 show_flow=vis_settings.get('display', {}).get('show_flow', True),
                 show_plates=vis_settings.get('display', {}).get('show_plates', True),
+                show_traffic_lights=vis_settings.get('display', {}).get('show_traffic_lights', True),
                 window_name=vis_settings.get('display', {}).get('window_name', "Traffic Monitoring System"),
                 fullscreen=vis_settings.get('display', {}).get('fullscreen', False),
                 display_fps=vis_settings.get('display', {}).get('display_fps', 30),
@@ -427,6 +580,18 @@ class TrafficMonitoringSystem:
                 logger.error(f"Failed to start video stream for camera {camera_id}")
             else:
                 logger.info(f"Started video stream for camera {camera_id}")
+        
+        # Start traffic light controllers
+        for intersection_id, controller in self.traffic_controllers.items():
+            if controller.start():
+                logger.info(f"Started traffic light controller for intersection {intersection_id}")
+            else:
+                logger.error(f"Failed to start traffic light controller for intersection {intersection_id}")
+        
+        # Start traffic simulation if enabled
+        if self.simulation_model:
+            self.simulation_model.start()
+            logger.info("Started traffic simulation")
         
         # Start processing threads
         for camera_id in self.video_streams:
@@ -499,6 +664,7 @@ class TrafficMonitoringSystem:
                                 zones=traffic_counter.zones if traffic_counter else None,
                                 speeds=speed_measurements,
                                 plates=plate_detections,
+                                traffic_lights=self._get_traffic_light_states(camera_id),
                                 processing_time=(time.time() - start_time) * 1000
                             )
                         continue
@@ -534,8 +700,13 @@ class TrafficMonitoringSystem:
                     speed_measurements = speed_estimator.get_current_speeds()
                 
                 # Traffic flow analysis
+                flow_data = None
                 if flow_analyzer:
                     flow_data = flow_analyzer.process_frame(tracked_objects, speed_measurements)
+                    
+                    # Update traffic light controllers with flow data if available
+                    if flow_data and self.traffic_controllers:
+                        self._update_traffic_controllers(camera_id, flow_data, flow_analyzer)
                 
                 # Update visualization
                 if self.display_manager:
@@ -547,6 +718,7 @@ class TrafficMonitoringSystem:
                         speeds=speed_measurements,
                         plates=plate_detections,
                         flow_data=flow_analyzer.get_current_flow() if flow_analyzer else None,
+                        traffic_lights=self._get_traffic_light_states(camera_id),
                         processing_time=(time.time() - start_time) * 1000
                     )
             
@@ -554,6 +726,149 @@ class TrafficMonitoringSystem:
                 logger.error(f"Error processing frame for camera {camera_id}: {str(e)}")
         
         logger.info(f"Processing thread stopped for camera {camera_id}")
+    
+    def _update_traffic_controllers(self, camera_id, flow_data, flow_analyzer):
+        """
+        Update traffic light controllers with flow data.
+        
+        Args:
+            camera_id: Camera identifier
+            flow_data: Flow data from flow analyzer
+            flow_analyzer: Flow analyzer instance
+        """
+        # Map camera to intersection if defined in config
+        camera_to_intersection = {}
+        for intersection in self.traffic_management_config.get('intersections', []):
+            for camera in intersection.get('cameras', []):
+                if camera == camera_id:
+                    camera_to_intersection[camera_id] = intersection.get('id')
+        
+        # Get current flow for all regions
+        current_flow = flow_analyzer.get_current_flow()
+        if not current_flow:
+            return
+        
+        # Update appropriate traffic controller
+        for intersection_id, controller in self.traffic_controllers.items():
+            # Check if this camera is mapped to this intersection
+            if camera_id in camera_to_intersection and camera_to_intersection[camera_id] == intersection_id:
+                controller.update(current_flow)
+                
+                # Run signal optimization if it's time
+                self._run_signal_optimization(intersection_id, current_flow)
+    
+    def _run_signal_optimization(self, intersection_id, flow_data):
+        """
+        Run signal optimization for an intersection.
+        
+        Args:
+            intersection_id: Intersection identifier
+            flow_data: Current flow data
+        """
+        if intersection_id not in self.signal_optimizers:
+            return
+            
+        # Get controller
+        controller = self.traffic_controllers.get(intersection_id)
+        if not controller:
+            return
+            
+        # Get current timings
+        current_state = controller.get_current_state()
+        current_plan = controller.plans.get(current_state['active_plan_id'])
+        
+        if not current_plan:
+            return
+            
+        # Convert flow data to optimizer input format
+        # This is a simplified version - a full implementation would need more conversion
+        movements = {}
+        phases = {}
+        
+        # Example of converting flow data to movements
+        # In a real system, this would be much more sophisticated
+        for region_id, flow_value in flow_data.items():
+            if isinstance(flow_value, dict):
+                # Handle dictionary flow data
+                movement_id = f"movement_{region_id}"
+                
+                # Create basic movement data
+                movements[movement_id] = {
+                    'id': movement_id,
+                    'demand': {
+                        'flow_rate': flow_value.get('vehicle_count', 0) * 120,  # Convert to hourly rate
+                        'queue_length': flow_value.get('queue_length', 0),
+                        'density': flow_value.get('density', 0)
+                    },
+                    'saturation_flow': 1800  # Default value
+                }
+            
+        # Run optimization
+        optimizer = self.signal_optimizers[intersection_id]
+        
+        try:
+            # This is a placeholder - actual implementation would format data properly
+            optimization_result = optimizer.optimize(
+                movements={},  # Properly formatted movements
+                phases={},     # Properly formatted phases
+                current_timings={phase_id: duration for phase_id, duration in current_state.get('phase_durations', {}).items()},
+                coordination_data=None  # Coordination data if needed
+            )
+            
+            # Apply optimization result if significant improvement
+            if optimization_result and optimization_result.delay_reduction > 5.0:
+                # Apply new signal plan
+                new_plan = SignalPlan(
+                    cycle_length=optimization_result.cycle_length,
+                    phases=[{
+                        'name': f"Phase {i+1}",
+                        'min_time': duration * 0.8,  # Estimate, assuming 80% is green time
+                        'max_time': duration * 0.8 * 1.5,  # Allow 50% extension
+                        'signals': {}  # This would need proper signal state mapping
+                    } for i, (phase_id, duration) in enumerate(optimization_result.phase_durations.items())],
+                    offset=optimization_result.offset,
+                    plan_id=f"optimized_{int(time.time())}",
+                    description=f"Optimized plan: {optimization_result.optimization_method}"
+                )
+                
+                # Add plan to controller
+                controller.add_signal_plan(new_plan.to_dict())
+                
+                # Activate new plan
+                controller.set_active_plan(new_plan.plan_id)
+                
+                logger.info(f"Applied optimized signal plan to intersection {intersection_id}: " +
+                          f"cycle={optimization_result.cycle_length:.1f}s, delay reduction={optimization_result.delay_reduction:.1f}%")
+        except Exception as e:
+            logger.error(f"Error running signal optimization for intersection {intersection_id}: {str(e)}")
+    
+    def _get_traffic_light_states(self, camera_id):
+        """
+        Get traffic light states for display.
+        
+        Args:
+            camera_id: Camera identifier
+        
+        Returns:
+            Dictionary of traffic light states by intersection
+        """
+        # Map camera to intersection if defined in config
+        camera_to_intersection = {}
+        for intersection in self.traffic_management_config.get('intersections', []):
+            for camera in intersection.get('cameras', []):
+                if camera == camera_id:
+                    camera_to_intersection[camera_id] = intersection.get('id')
+        
+        traffic_lights = {}
+        
+        # Get state from appropriate traffic controller
+        for intersection_id, controller in self.traffic_controllers.items():
+            # Check if this camera is mapped to this intersection
+            if camera_id in camera_to_intersection and camera_to_intersection[camera_id] == intersection_id:
+                state = controller.get_current_state()
+                traffic_lights[intersection_id] = state
+        
+        return traffic_lights
     
     def stop(self):
         """Stop the traffic monitoring system."""
@@ -564,6 +879,16 @@ class TrafficMonitoringSystem:
         
         # Signal threads to stop
         self.stop_event.set()
+        
+        # Stop traffic controllers
+        for intersection_id, controller in self.traffic_controllers.items():
+            controller.stop()
+            logger.info(f"Stopped traffic light controller for intersection {intersection_id}")
+        
+        # Stop traffic simulation if enabled
+        if self.simulation_model:
+            self.simulation_model.stop()
+            logger.info("Stopped traffic simulation")
         
         # Stop video streams
         for camera_id, stream in self.video_streams.items():
