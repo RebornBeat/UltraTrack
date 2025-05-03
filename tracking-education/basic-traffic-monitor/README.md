@@ -52,10 +52,18 @@ Follow the step-by-step guide in [Installation Guide](docs/installation_guide.md
 ## Exploration Questions
 
 1. How does the positioning of the camera affect detection accuracy?
-2. What is the maximum distance at which the system can reliably detect vehicles?
-3. How do weather conditions affect the system's performance?
-4. What privacy considerations should be taken into account when deploying such a system?
-5. How could this system be integrated with traffic light control?
+2. How do weather conditions affect the system's performance?
+3. What privacy considerations should be taken into account when deploying such a system?
+4. How could this system be integrated with traffic light control?
+5. What is the maximum distance at which the system can reliably detect vehicles?
+6. How do lighting conditions affect performance throughout the day?
+7. Can the system be trained to recognize specific vehicle types or models?
+8. How could multiple camera systems be coordinated to track vehicles across larger areas?
+9. What methods could be used to anonymize license plate data while still tracking flow?
+10. How accurate is speed estimation, and what factors improve or reduce accuracy?
+11. What is the computational bottleneck in the system, and how could it be optimized?
+12. How could this system be integrated with existing traffic management infrastructure?
+13. What privacy and ethical considerations arise when implementing traffic monitoring?
 
 ## Ethical Guidelines
 
