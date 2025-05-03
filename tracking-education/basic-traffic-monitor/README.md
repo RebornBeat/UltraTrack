@@ -38,4 +38,33 @@ Follow the step-by-step guide in [Installation Guide](docs/installation_guide.md
 
 1. Position the camera to overlook a traffic area
 2. Configure the system parameters in `config/system_settings.json`
-3. Run the system:
+3. Run the system: `python -m src.main`
+4. Access the visualization dashboard at http://localhost:8050
+
+## Project Extensions
+
+- Add traffic light timing optimization
+- Implement cloud data backup
+- Create time-of-day traffic pattern analysis
+- Add vehicle classification (car, truck, motorcycle, etc.)
+- Implement multi-camera integration
+
+## Exploration Questions
+
+1. How does the positioning of the camera affect detection accuracy?
+2. What is the maximum distance at which the system can reliably detect vehicles?
+3. How do weather conditions affect the system's performance?
+4. What privacy considerations should be taken into account when deploying such a system?
+5. How could this system be integrated with traffic light control?
+
+## Ethical Guidelines
+
+This project is designed for educational purposes only. When deploying any camera system:
+- Ensure you have permission to monitor the area
+- Do not store personally identifiable information
+- Consider privacy implications and local regulations
+- Use data only for educational analysis
+
+## License
+
+MIT License - See LICENSE file for details.
