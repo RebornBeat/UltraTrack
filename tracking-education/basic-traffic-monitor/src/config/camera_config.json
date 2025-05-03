@@ -1,0 +1,206 @@
+{
+  "cameras": [
+    {
+      "camera_id": "cam_north_01",
+      "name": "North Entrance Camera 1",
+      "camera_type": "IP",
+      "url": "rtsp://192.168.1.101:554/stream1",
+      "username": "admin",
+      "password": "secure_password_123",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "rotation": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "exposure_mode": "auto",
+      "white_balance": "auto",
+      "buffer_size": 10,
+      "enabled": true,
+      "recording": {
+        "enabled": true,
+        "storage_path": "/data/recordings/cam_north_01",
+        "file_duration_minutes": 15,
+        "retention_days": 30,
+        "record_on_motion_only": false
+      },
+      "zones": [
+        {
+          "id": "north_entrance_zone",
+          "name": "North Entrance",
+          "polygon": [[100, 200], [1800, 200], [1800, 900], [100, 900]],
+          "direction": [0, 1],
+          "vehicle_types": ["CAR", "TRUCK", "BUS", "MOTORCYCLE"]
+        },
+        {
+          "id": "north_exit_zone",
+          "name": "North Exit",
+          "polygon": [[100, 100], [500, 100], [500, 200], [100, 200]],
+          "direction": [0, -1],
+          "vehicle_types": ["CAR", "TRUCK", "BUS", "MOTORCYCLE"]
+        }
+      ],
+      "speed_lines": [
+        {
+          "id": "north_speed_line_1",
+          "points": [[100, 500], [1800, 500]],
+          "distance_meters": 10.0
+        },
+        {
+          "id": "north_speed_line_2",
+          "points": [[100, 700], [1800, 700]],
+          "distance_meters": 10.0
+        }
+      ],
+      "calibration": {
+        "method": "REFERENCE_LINE",
+        "reference_line": [[100, 500], [1800, 500]],
+        "real_length": 12.5
+      }
+    },
+    {
+      "camera_id": "cam_south_01",
+      "name": "South Entrance Camera 1",
+      "camera_type": "RTSP",
+      "url": "rtsp://192.168.1.102:554/stream1",
+      "username": "admin",
+      "password": "secure_password_456",
+      "width": 1920,
+      "height": 1080,
+      "fps": 30,
+      "rotation": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "exposure_mode": "auto",
+      "white_balance": "auto",
+      "buffer_size": 10,
+      "enabled": true,
+      "recording": {
+        "enabled": true,
+        "storage_path": "/data/recordings/cam_south_01",
+        "file_duration_minutes": 15,
+        "retention_days": 30,
+        "record_on_motion_only": false
+      },
+      "zones": [
+        {
+          "id": "south_entrance_zone",
+          "name": "South Entrance",
+          "polygon": [[200, 300], [1700, 300], [1700, 900], [200, 900]],
+          "direction": [0, 1],
+          "vehicle_types": ["CAR", "TRUCK", "BUS", "MOTORCYCLE"]
+        }
+      ],
+      "speed_lines": [
+        {
+          "id": "south_speed_line_1",
+          "points": [[200, 400], [1700, 400]],
+          "distance_meters": 8.5
+        },
+        {
+          "id": "south_speed_line_2",
+          "points": [[200, 800], [1700, 800]],
+          "distance_meters": 8.5
+        }
+      ],
+      "calibration": {
+        "method": "REFERENCE_LINE",
+        "reference_line": [[200, 400], [1700, 400]],
+        "real_length": 10.2
+      }
+    },
+    {
+      "camera_id": "cam_east_01",
+      "name": "East Intersection Camera 1",
+      "camera_type": "PICAMERA",
+      "width": 1280,
+      "height": 720,
+      "fps": 25,
+      "rotation": 180,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "exposure_mode": "auto",
+      "white_balance": "auto",
+      "buffer_size": 5,
+      "enabled": true,
+      "recording": {
+        "enabled": true,
+        "storage_path": "/data/recordings/cam_east_01",
+        "file_duration_minutes": 15,
+        "retention_days": 15,
+        "record_on_motion_only": true
+      },
+      "zones": [
+        {
+          "id": "east_intersection_zone",
+          "name": "East Intersection",
+          "polygon": [[100, 300], [1200, 300], [1200, 700], [100, 700]],
+          "direction": [1, 0],
+          "vehicle_types": ["CAR", "TRUCK", "BUS", "MOTORCYCLE", "BICYCLE"]
+        }
+      ],
+      "speed_lines": [
+        {
+          "id": "east_speed_line_1",
+          "points": [[300, 300], [300, 700]],
+          "distance_meters": 5.0
+        },
+        {
+          "id": "east_speed_line_2",
+          "points": [[800, 300], [800, 700]],
+          "distance_meters": 5.0
+        }
+      ],
+      "calibration": {
+        "method": "PIXEL_DISTANCE",
+        "meters_per_pixel": 0.02
+      }
+    },
+    {
+      "camera_id": "cam_west_01",
+      "name": "West Intersection Camera 1",
+      "camera_type": "USB",
+      "camera_id": "0",
+      "width": 1280,
+      "height": 720,
+      "fps": 30,
+      "rotation": 0,
+      "flip_horizontal": false,
+      "flip_vertical": false,
+      "exposure_mode": "auto",
+      "white_balance": "auto",
+      "buffer_size": 5,
+      "enabled": true,
+      "recording": {
+        "enabled": false
+      },
+      "zones": [
+        {
+          "id": "west_intersection_zone",
+          "name": "West Intersection",
+          "polygon": [[200, 200], [1100, 200], [1100, 650], [200, 650]],
+          "direction": [-1, 0],
+          "vehicle_types": ["CAR", "TRUCK", "BUS", "MOTORCYCLE", "BICYCLE"]
+        }
+      ],
+      "calibration": {
+        "method": "PIXEL_DISTANCE",
+        "meters_per_pixel": 0.025
+      }
+    }
+  ],
+  "global_settings": {
+    "frame_buffer_size": 120,
+    "video_storage_format": "MP4",
+    "video_codec": "H264",
+    "enable_timestamp_overlay": true,
+    "enable_camera_name_overlay": true,
+    "timestamp_format": "%Y-%m-%d %H:%M:%S",
+    "default_resolution": [1280, 720],
+    "low_light_threshold": 30,
+    "auto_reconnect": true,
+    "reconnect_attempts": 5,
+    "reconnect_delay_seconds": 10,
+    "health_check_interval_seconds": 60
+  }
+}
