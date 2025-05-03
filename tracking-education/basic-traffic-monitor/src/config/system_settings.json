@@ -1,0 +1,280 @@
+{
+  "system": {
+    "name": "Traffic Monitoring System",
+    "version": "1.0.0",
+    "log_level": "INFO",
+    "log_file": "/var/log/traffic_monitor/system.log",
+    "log_rotation": {
+      "max_size_mb": 100,
+      "backup_count": 10
+    },
+    "timezone": "UTC",
+    "locale": "en_US"
+  },
+  "processing": {
+    "detection": {
+      "model_type": "YOLO",
+      "model_path": "/opt/traffic_monitor/models/yolo",
+      "confidence_threshold": 0.6,
+      "nms_threshold": 0.4,
+      "input_width": 416,
+      "input_height": 416,
+      "use_gpu": true,
+      "batch_size": 1,
+      "max_objects_per_frame": 50,
+      "classes_of_interest": ["CAR", "TRUCK", "BUS", "MOTORCYCLE", "BICYCLE", "PEDESTRIAN"]
+    },
+    "tracking": {
+      "max_distance": 100.0,
+      "max_frames_to_skip": 30,
+      "max_trace_length": 50,
+      "min_detection_confidence": 0.6,
+      "min_track_length": 5
+    },
+    "background_subtraction": {
+      "method": "MOG2",
+      "history": 500,
+      "learning_rate": 0.01,
+      "detect_shadows": true,
+      "threshold": 16,
+      "kernel_size": 3
+    },
+    "license_plate": {
+      "enabled": true,
+      "detector_cascade_path": "/opt/traffic_monitor/models/haarcascades/haarcascade_russian_plate_number.xml",
+      "min_plate_width": 60,
+      "min_plate_height": 20,
+      "ocr_config": "--oem 1 --psm 8 -c tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-",
+      "confidence_threshold": 0.7,
+      "max_workers": 4
+    },
+    "performance": {
+      "max_fps": 30,
+      "processing_threads": 8,
+      "gpu_memory_fraction": 0.7,
+      "enable_frame_skipping": true,
+      "frame_skip_threshold_ms": 50,
+      "processing_priority": "high"
+    }
+  },
+  "analysis": {
+    "speed_estimation": {
+      "calibration_method": "REFERENCE_LINE",
+      "min_tracking_points": 5,
+      "smoothing_factor": 0.3,
+      "min_speed_confidence": 0.7,
+      "store_history": true,
+      "max_history_items": 10000
+    },
+    "counting": {
+      "min_motion_frames": 3,
+      "max_motion_frames": 30,
+      "cooldown_frames": 10,
+      "store_history": true,
+      "max_history_items": 10000
+    },
+    "flow": {
+      "flow_history_length": 150,
+      "update_interval": 30,
+      "store_history": true,
+      "max_history_items": 5000,
+      "density_thresholds": {
+        "VERY_LOW": 0.0,
+        "LOW": 0.05,
+        "MODERATE": 0.15,
+        "HIGH": 0.25,
+        "VERY_HIGH": 0.35,
+        "CONGESTED": 0.5
+      }
+    },
+    "alerts": {
+      "enabled": true,
+      "speed_threshold_km_h": 80,
+      "congestion_threshold": "HIGH",
+      "stopped_vehicle_time_threshold_sec": 120,
+      "wrong_way_detection": true,
+      "notification_channels": ["email", "webhook", "dashboard"],
+      "email_recipients": ["traffic_admin@example.com", "operations@example.com"],
+      "webhook_url": "https://api.example.com/traffic_alerts",
+      "alert_cooldown_sec": 300
+    }
+  },
+  "storage": {
+    "database": {
+      "type": "postgresql",
+      "host": "localhost",
+      "port": 5432,
+      "database": "traffic_monitor",
+      "user": "traffic_user",
+      "password": "db_password_here",
+      "min_connections": 2,
+      "max_connections": 10,
+      "connection_timeout": 30,
+      "retry_attempts": 3,
+      "retry_delay": 2
+    },
+    "video_storage": {
+      "base_path": "/data/recordings",
+      "structure": "{camera_id}/{year}/{month}/{day}",
+      "file_format": "{camera_id}_{timestamp}_{duration}.mp4",
+      "temp_storage_path": "/data/temp",
+      "retention_policy_days": 30,
+      "low_space_threshold_gb": 50,
+      "auto_cleanup": true
+    },
+    "data_export": {
+      "default_path": "/data/exports",
+      "default_format": "CSV",
+      "available_formats": ["CSV", "JSON", "HTML", "PDF"]
+    }
+  },
+  "visualization": {
+    "display": {
+      "enabled": true,
+      "default_mode": "COMPOSITE",
+      "show_boxes": true,
+      "show_labels": true,
+      "show_ids": true,
+      "show_trails": true,
+      "show_zones": true,
+      "show_speed": true,
+      "show_flow": true,
+      "show_plates": true,
+      "window_name": "Traffic Monitoring System",
+      "fullscreen": false,
+      "display_fps": 30,
+      "overlay_alpha": 0.4,
+      "font_scale": 0.7,
+      "line_thickness": 2
+    },
+    "reporting": {
+      "report_path": "/data/reports",
+      "auto_generate_reports": true,
+      "report_interval_hours": 24,
+      "report_types": ["VEHICLE_COUNT", "SPEED_DISTRIBUTION", "HOURLY_DISTRIBUTION", "VEHICLE_TYPES"],
+      "include_timestamp": true,
+      "include_logo": true,
+      "logo_path": "/opt/traffic_monitor/assets/logo.png",
+      "export_formats": ["PNG", "PDF", "CSV"]
+    }
+  },
+  "api": {
+    "rest": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 8080,
+      "ssl": {
+        "enabled": true,
+        "cert_path": "/etc/traffic_monitor/ssl/server.crt",
+        "key_path": "/etc/traffic_monitor/ssl/server.key"
+      },
+      "auth": {
+        "enabled": true,
+        "method": "jwt",
+        "token_expiry_minutes": 60,
+        "refresh_token_expiry_days": 7,
+        "secret_key": "your_jwt_secret_key_here"
+      },
+      "rate_limiting": {
+        "enabled": true,
+        "requests_per_minute": 60
+      },
+      "cors": {
+        "enabled": true,
+        "allowed_origins": ["https://dashboard.example.com"],
+        "allowed_methods": ["GET", "POST", "PUT", "DELETE"],
+        "allow_credentials": true
+      }
+    },
+    "grpc": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 50051,
+      "max_workers": 10,
+      "max_message_length_mb": 100,
+      "ssl": {
+        "enabled": true,
+        "cert_path": "/etc/traffic_monitor/ssl/server.crt",
+        "key_path": "/etc/traffic_monitor/ssl/server.key"
+      }
+    }
+  },
+  "security": {
+    "encryption": {
+      "data_at_rest": true,
+      "data_in_transit": true,
+      "key_rotation_days": 30,
+      "algorithm": "AES-256-GCM"
+    },
+    "authentication": {
+      "require_mfa": true,
+      "password_policy": {
+        "min_length": 12,
+        "require_uppercase": true,
+        "require_lowercase": true,
+        "require_numbers": true,
+        "require_special_chars": true,
+        "max_age_days": 90
+      },
+      "session_timeout_minutes": 30,
+      "max_failed_attempts": 5,
+      "lockout_period_minutes": 15
+    },
+    "authorization": {
+      "roles": [
+        {
+          "name": "admin",
+          "permissions": ["read", "write", "configure", "export", "delete"]
+        },
+        {
+          "name": "operator",
+          "permissions": ["read", "write", "export"]
+        },
+        {
+          "name": "viewer",
+          "permissions": ["read"]
+        }
+      ],
+      "default_role": "viewer"
+    },
+    "audit": {
+      "enabled": true,
+      "log_path": "/var/log/traffic_monitor/audit.log",
+      "log_level": "INFO",
+      "include_user_actions": true,
+      "include_system_events": true,
+      "rotation": {
+        "max_size_mb": 100,
+        "backup_count": 20
+      },
+      "retention_days": 365
+    }
+  },
+  "deployment": {
+    "environment": "production",
+    "auto_start": true,
+    "recovery": {
+      "enabled": true,
+      "max_restarts": 5,
+      "restart_delay_seconds": 10,
+      "health_check_interval_seconds": 60
+    },
+    "resources": {
+      "min_memory_mb": 4096,
+      "min_disk_space_gb": 100,
+      "cpu_priority": "high",
+      "gpu_required": true
+    },
+    "monitoring": {
+      "system_metrics_interval_seconds": 60,
+      "process_metrics_interval_seconds": 30,
+      "alert_on_high_cpu": true,
+      "alert_on_high_memory": true,
+      "alert_on_low_disk": true,
+      "alert_on_service_down": true,
+      "cpu_threshold_percent": 90,
+      "memory_threshold_percent": 85,
+      "disk_threshold_percent": 90
+    }
+  }
+}
