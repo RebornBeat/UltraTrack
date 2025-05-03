@@ -479,3 +479,411 @@ class FlowAnalyzer:
         if self.use_speed_data and region_data['vehicle_speeds']:
             avg_speed = sum(region_data['vehicle_speeds'].values()) / len(region_data['vehicle_speeds'])
         else:
+            avg_speed = 0.0
+        
+        # Combine direction counts from all frames
+        combined_direction_counts = {}
+        for direction_counts in region_data['flow_directions'].values():
+            for direction, count in direction_counts.items():
+                combined_direction_counts[direction] = combined_direction_counts.get(direction, 0) + count
+        
+        # Determine dominant direction
+        dominant_direction = self._get_dominant_direction(combined_direction_counts)
+        
+        # Calculate region area
+        region_area = self._calculate_region_area(region_polygon)
+        
+        # Determine density level
+        density_level = self._get_density_level(avg_count, region_area)
+        
+        # Create flow object
+        flow = TrafficFlow(
+            region_id=region_id,
+            timestamp=time.time(),
+            density=density_level,
+            vehicle_count=int(avg_count),
+            avg_speed=avg_speed,
+            dominant_direction=dominant_direction,
+            directional_counts=combined_direction_counts
+        )
+        
+        return flow
+    
+    def _update_density_map(self, detections: List[Detection]):
+        """
+        Update density map based on current detections.
+        
+        Args:
+            detections: List of vehicle detections
+        """
+        # Create new density map
+        new_density = np.zeros_like(self.density_map)
+        
+        # Add vehicle positions to density map
+        for detection in detections:
+            center_x, center_y = detection.center()
+            if 0 <= center_x < self.frame_size[0] and 0 <= center_y < self.frame_size[1]:
+                # Add Gaussian blob at vehicle position
+                new_density[center_y, center_x] = 1.0
+        
+        # Apply Gaussian blur to spread density
+        new_density = gaussian_filter(new_density, sigma=15)
+        
+        # Normalize density
+        if np.max(new_density) > 0:
+            new_density = new_density / np.max(new_density)
+        
+        # Update density map with temporal smoothing
+        self.density_map = self.density_map * 0.8 + new_density * 0.2
+    
+    def _update_flow_map(self, detections: List[Detection], speeds: Optional[Dict[int, float]] = None):
+        """
+        Update flow map based on current detections and speeds.
+        
+        Args:
+            detections: List of vehicle detections
+            speeds: Optional dictionary of vehicle_id -> speed (km/h)
+        """
+        # Create new flow map
+        new_flow = np.zeros_like(self.flow_map)
+        
+        # Process each region
+        for region_id, region_data in self.region_data.items():
+            # Get recent vehicle positions
+            recent_positions = sorted(region_data['vehicle_positions'], reverse=True)
+            
+            # Group by vehicle ID
+            positions_by_vehicle = {}
+            for frame, vehicle_id, x, y, direction, speed in recent_positions:
+                if vehicle_id not in positions_by_vehicle:
+                    positions_by_vehicle[vehicle_id] = []
+                positions_by_vehicle[vehicle_id].append((frame, x, y, direction, speed))
+            
+            # Calculate flow vectors for each vehicle
+            for vehicle_id, positions in positions_by_vehicle.items():
+                if len(positions) >= 2:
+                    # Get most recent positions
+                    current = positions[0]
+                    previous = positions[1]
+                    
+                    # Calculate flow vector
+                    _, curr_x, curr_y, _, curr_speed = current
+                    _, prev_x, prev_y, _, _ = previous
+                    
+                    # Skip if positions are identical
+                    if curr_x == prev_x and curr_y == prev_y:
+                        continue
+                    
+                    # Calculate direction vector
+                    dx = curr_x - prev_x
+                    dy = curr_y - prev_y
+                    
+                    # Normalize vector
+                    magnitude = np.sqrt(dx*dx + dy*dy)
+                    if magnitude > 0:
+                        dx = dx / magnitude
+                        dy = dy / magnitude
+                    
+                    # Apply speed scaling if available
+                    if speeds and vehicle_id in speeds:
+                        speed = speeds[vehicle_id]
+                        dx = dx * min(50.0, speed) / 50.0
+                        dy = dy * min(50.0, speed) / 50.0
+                    
+                    # Add flow vector to the map
+                    if 0 <= curr_x < self.frame_size[0] and 0 <= curr_y < self.frame_size[1]:
+                        new_flow[int(curr_y), int(curr_x), 0] = dx
+                        new_flow[int(curr_y), int(curr_x), 1] = dy
+        
+        # Apply Gaussian blur to spread flow vectors
+        new_flow[:, :, 0] = gaussian_filter(new_flow[:, :, 0], sigma=5)
+        new_flow[:, :, 1] = gaussian_filter(new_flow[:, :, 1], sigma=5)
+        
+        # Update flow map with temporal smoothing
+        self.flow_map = self.flow_map * 0.9 + new_flow * 0.1
+    
+    def get_current_flow(self, region_id: Optional[str] = None) -> Union[TrafficFlow, Dict[str, TrafficFlow], None]:
+        """
+        Get current flow for a region or all regions.
+        
+        Args:
+            region_id: Optional region identifier
+        
+        Returns:
+            TrafficFlow object, dictionary of region_id -> TrafficFlow, or None if no data
+        """
+        with self.lock:
+            if region_id:
+                if region_id not in self.region_data:
+                    return None
+                return self.region_data[region_id]['last_flow']
+            else:
+                # Return all regions
+                flows = {}
+                for rid, data in self.region_data.items():
+                    if data['last_flow']:
+                        flows[rid] = data['last_flow']
+                return flows if flows else None
+    
+    def get_flow_history(self, region_id: Optional[str] = None,
+                        max_items: Optional[int] = None,
+                        time_period: Optional[Tuple[float, float]] = None) -> List[TrafficFlow]:
+        """
+        Get flow history for a region or all regions.
+        
+        Args:
+            region_id: Optional region identifier to filter by
+            max_items: Maximum items to return
+            time_period: Optional time range as (start_time, end_time) timestamps
+        
+        Returns:
+            List of TrafficFlow objects
+        """
+        if not self.store_history:
+            logger.warning("History storage is disabled")
+            return []
+        
+        with self.lock:
+            # Filter history
+            filtered = self.history.copy()
+            
+            # Filter by region ID if specified
+            if region_id:
+                filtered = [f for f in filtered if f.region_id == region_id]
+            
+            # Filter by time period if specified
+            if time_period:
+                start_time, end_time = time_period
+                filtered = [f for f in filtered if start_time <= f.timestamp <= end_time]
+            
+            # Sort by timestamp (newest first)
+            filtered.sort(key=lambda f: f.timestamp, reverse=True)
+            
+            # Limit number of items if specified
+            if max_items:
+                filtered = filtered[:max_items]
+            
+            return filtered
+    
+    def get_density_map(self) -> np.ndarray:
+        """
+        Get current traffic density map.
+        
+        Returns:
+            Numpy array representing density (0-1 range)
+        """
+        with self.lock:
+            return self.density_map.copy()
+    
+    def get_flow_map(self) -> np.ndarray:
+        """
+        Get current traffic flow map.
+        
+        Returns:
+            Numpy array representing flow vectors (x, y components)
+        """
+        with self.lock:
+            return self.flow_map.copy()
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """
+        Get analyzer statistics.
+        
+        Returns:
+            Dictionary of analyzer statistics
+        """
+        with self.lock:
+            return {
+                'regions': len(self.regions),
+                'frames_processed': self.frames_processed,
+                'flow_updates': self.flow_updates,
+                'history_enabled': self.store_history,
+                'history_items': len(self.history) if self.store_history else 0
+            }
+    
+    def reset(self):
+        """Reset all flow data."""
+        with self.lock:
+            # Reset region data
+            for region_id in self.regions:
+                self.region_data[region_id] = {
+                    'vehicle_positions': [],
+                    'vehicle_counts': {},
+                    'vehicle_speeds': {},
+                    'flow_directions': {},
+                    'current_vehicles': set(),
+                    'last_flow': None
+                }
+            
+            # Reset maps
+            self.density_map = np.zeros_like(self.density_map)
+            self.flow_map = np.zeros_like(self.flow_map)
+            
+            # Reset history
+            if self.store_history:
+                self.history = []
+            
+            # Reset statistics
+            self.frames_processed = 0
+            self.flow_updates = 0
+            
+            logger.info("Flow analyzer reset")
+    
+    def update_regions(self, regions: Dict[str, List[Tuple[int, int]]]):
+        """
+        Update analysis regions.
+        
+        Args:
+            regions: Dictionary of region_id -> polygon points
+        """
+        with self.lock:
+            # Store old data for migration
+            old_data = self.region_data
+            
+            # Update regions
+            self.regions = regions
+            
+            # Create new region data
+            self.region_data = {}
+            for region_id in self.regions:
+                if region_id in old_data:
+                    # Reuse existing data for this region
+                    self.region_data[region_id] = old_data[region_id]
+                else:
+                    # Create new data structure for new region
+                    self.region_data[region_id] = {
+                        'vehicle_positions': [],
+                        'vehicle_counts': {},
+                        'vehicle_speeds': {},
+                        'flow_directions': {},
+                        'current_vehicles': set(),
+                        'last_flow': None
+                    }
+            
+            logger.info(f"Updated regions: now using {len(self.regions)} regions")
+    
+    def draw_flow_visualization(self, frame: np.ndarray, 
+                              draw_density: bool = True,
+                              draw_flow: bool = True,
+                              draw_regions: bool = True,
+                              density_alpha: float = 0.5,
+                              flow_scale: float = 10.0,
+                              flow_threshold: float = 0.05,
+                              flow_grid_step: int = 20) -> np.ndarray:
+        """
+        Draw flow visualization on a frame.
+        
+        Args:
+            frame: Input video frame
+            draw_density: Whether to draw density map
+            draw_flow: Whether to draw flow vectors
+            draw_regions: Whether to draw region boundaries
+            density_alpha: Alpha value for density overlay (0-1)
+            flow_scale: Scaling factor for flow vectors
+            flow_threshold: Minimum flow magnitude to draw
+            flow_grid_step: Grid step size for flow vectors
+        
+        Returns:
+            Frame with visualization overlay
+        """
+        # Make a copy of the frame
+        output = frame.copy()
+        
+        with self.lock:
+            # Draw density map if enabled
+            if draw_density:
+                # Create colored density map
+                colored_density = cv2.applyColorMap(
+                    (self.density_map * 255).astype(np.uint8), 
+                    cv2.COLORMAP_JET
+                )
+                
+                # Create mask for areas with significant density
+                mask = (self.density_map > 0.05).astype(np.uint8) * 255
+                
+                # Apply mask to colored density
+                masked_density = cv2.bitwise_and(colored_density, colored_density, mask=mask)
+                
+                # Blend with original frame
+                cv2.addWeighted(output, 1.0, masked_density, density_alpha, 0, output)
+            
+            # Draw flow vectors if enabled
+            if draw_flow:
+                # Get flow map
+                flow = self.flow_map
+                
+                # Draw flow vectors on a grid
+                h, w = flow.shape[:2]
+                y, x = np.mgrid[0:h:flow_grid_step, 0:w:flow_grid_step].reshape(2, -1).astype(int)
+                
+                # Filter points outside the frame
+                mask = (x >= 0) & (x < w) & (y >= 0) & (y < h)
+                x, y = x[mask], y[mask]
+                
+                # Get flow vectors at grid points
+                fx, fy = flow[y, x, 0], flow[y, x, 1]
+                
+                # Calculate vector magnitudes
+                magnitude = np.sqrt(fx**2 + fy**2)
+                
+                # Filter by threshold
+                mask = magnitude > flow_threshold
+                x, y, fx, fy = x[mask], y[mask], fx[mask], fy[mask]
+                
+                # Draw arrows
+                for i in range(len(x)):
+                    cv2.arrowedLine(
+                        output,
+                        (int(x[i]), int(y[i])),
+                        (int(x[i] + fx[i] * flow_scale), int(y[i] + fy[i] * flow_scale)),
+                        (0, 255, 255),
+                        1,
+                        cv2.LINE_AA,
+                        tipLength=0.3
+                    )
+            
+            # Draw region boundaries if enabled
+            if draw_regions:
+                for region_id, polygon in self.regions.items():
+                    # Get flow data for this region
+                    flow_data = self.region_data[region_id]['last_flow']
+                    
+                    # Convert polygon to numpy array
+                    points = np.array(polygon, dtype=np.int32).reshape((-1, 1, 2))
+                    
+                    # Determine color based on density level
+                    if flow_data and hasattr(flow_data, 'density'):
+                        if flow_data.density == TrafficDensity.VERY_LOW:
+                            color = (0, 255, 0)  # Green
+                        elif flow_data.density == TrafficDensity.LOW:
+                            color = (0, 255, 255)  # Yellow
+                        elif flow_data.density == TrafficDensity.MODERATE:
+                            color = (0, 165, 255)  # Orange
+                        elif flow_data.density == TrafficDensity.HIGH:
+                            color = (0, 0, 255)  # Red
+                        elif flow_data.density == TrafficDensity.VERY_HIGH:
+                            color = (128, 0, 255)  # Purple
+                        elif flow_data.density == TrafficDensity.CONGESTED:
+                            color = (0, 0, 128)  # Dark red
+                        else:
+                            color = (255, 255, 255)  # White
+                    else:
+                        color = (255, 255, 255)  # White
+                    
+                    # Draw polygon
+                    cv2.polylines(output, [points], True, color, 2)
+                    
+                    # Draw region label
+                    center_x = sum(p[0] for p in polygon) // len(polygon)
+                    center_y = sum(p[1] for p in polygon) // len(polygon)
+                    
+                    # Prepare label text
+                    label = region_id
+                    if flow_data:
+                        label += f": {flow_data.vehicle_count} vehicles"
+                    
+                    # Draw label
+                    cv2.putText(output, label, (center_x, center_y), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
+        
+        return output
