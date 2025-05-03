@@ -1,2358 +1,1566 @@
 """
-Signal optimization module for traffic light timing optimization.
-Implements various optimization strategies for different traffic conditions.
+Intersection management module for coordinating multiple traffic intersections.
+Implements network-wide coordination, green wave management, and emergency prioritization.
 """
 
 import time
 import logging
+import threading
+import json
 import math
 from enum import Enum
-from typing import Dict, List, Tuple, Optional, Any, Union, Callable, Set
-from dataclasses import dataclass
+from typing import Dict, List, Tuple, Optional, Any, Union, Set
+from dataclasses import dataclass, field
 import datetime
 import numpy as np
 from collections import defaultdict
+import heapq
+
+from .traffic_light_controller import TrafficLightController, SignalState, SignalTiming, SignalPlan
 
 # Configure logger for this module
 logger = logging.getLogger(__name__)
 
 
-@dataclass
-class TrafficDemand:
-    """Traffic demand data for a movement."""
-    count: int                  # Number of vehicles
-    queue_length: float         # Estimated queue length in vehicles
-    flow_rate: float            # Flow rate in vehicles per hour
-    saturation_rate: float      # Saturation flow rate (veh/hour of green)
-    heavy_vehicle_percentage: float  # Percentage of heavy vehicles
-    arrival_rate: float         # Vehicle arrival rate (vehicles per second)
-    peak_hour_factor: float     # Peak hour factor (0-1)
-    density: float              # Traffic density value (0-1)
-    platoon_ratio: float = 1.0  # Platoon ratio for coordination
+class LaneDirection(Enum):
+    """Direction of a lane at an intersection."""
+    NORTHBOUND = 'northbound'
+    SOUTHBOUND = 'southbound'
+    EASTBOUND = 'eastbound'
+    WESTBOUND = 'westbound'
+    NORTHBOUND_LEFT = 'northbound_left'
+    SOUTHBOUND_LEFT = 'southbound_left'
+    EASTBOUND_LEFT = 'eastbound_left'
+    WESTBOUND_LEFT = 'westbound_left'
+    NORTHBOUND_RIGHT = 'northbound_right'
+    SOUTHBOUND_RIGHT = 'southbound_right'
+    EASTBOUND_RIGHT = 'eastbound_right'
+    WESTBOUND_RIGHT = 'westbound_right'
 
 
 @dataclass
-class MovementData:
-    """Data for a specific traffic movement."""
-    id: str                     # Movement identifier (e.g., "northbound_through")
-    signals: List[str]          # List of signal IDs controlling this movement
-    demand: TrafficDemand       # Traffic demand data
-    capacity: float             # Movement capacity in vehicles per hour
-    saturation_flow: float      # Base saturation flow in vehicles per hour
-    min_green: float            # Minimum green time in seconds
-    max_green: float            # Maximum green time in seconds
-    yellow: float               # Yellow time in seconds
-    red_clearance: float        # All-red clearance time in seconds
-    startup_lost_time: float    # Startup lost time in seconds
-    lane_group_id: str = ""     # Lane group identifier for coordinated movements
-
-
-@dataclass
-class PhaseData:
-    """Data for a signal phase."""
-    id: str                     # Phase identifier
-    movements: List[str]        # List of movement IDs in this phase
-    min_green: float            # Minimum green time
-    max_green: float            # Maximum green time
-    yellow: float               # Yellow time
-    red_clearance: float        # All-red clearance time
-    pedestrian_calls: int       # Number of pedestrian calls
-    vehicle_calls: int          # Number of vehicle calls
-    is_coordinated: bool = False  # Whether this phase is coordinated
-    priority: int = 1           # Phase priority (higher = more important)
-
-
-@dataclass
-class OptimizationResult:
-    """Result of signal timing optimization."""
-    cycle_length: float                     # Optimized cycle length in seconds
-    phase_durations: Dict[str, float]       # Dictionary of phase ID -> duration
-    phase_sequence: List[str]               # Optimized phase sequence
-    offset: float = 0.0                     # Offset for coordination in seconds
-    performance_index: float = 0.0          # Performance index of optimization
-    delay_reduction: float = 0.0            # Estimated delay reduction in percent
-    optimization_method: str = ""           # Method used for optimization
-    timestamp: float = 0.0                  # Timestamp of optimization
-    
-    def __post_init__(self):
-        """Initialize after creation."""
-        if self.timestamp == 0.0:
-            self.timestamp = time.time()
+class Lane:
+    """
+    Represents a lane at an intersection.
+    """
+    id: str
+    direction: LaneDirection
+    length: float  # Length in meters
+    width: float  # Width in meters
+    speed_limit: float  # Speed limit in km/h
+    is_turning_lane: bool = False
+    is_through_lane: bool = True
+    is_shared_lane: bool = False
+    vehicle_count: int = 0
+    queue_length: float = 0.0  # Length of queue in meters
+    lane_group_id: Optional[str] = None
+    downstream_lanes: List[str] = field(default_factory=list)
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary."""
         return {
-            'cycle_length': self.cycle_length,
-            'phase_durations': self.phase_durations,
-            'phase_sequence': self.phase_sequence,
-            'offset': self.offset,
-            'performance_index': self.performance_index,
-            'delay_reduction': self.delay_reduction,
-            'optimization_method': self.optimization_method,
-            'timestamp': self.timestamp
+            'id': self.id,
+            'direction': self.direction.value,
+            'length': self.length,
+            'width': self.width,
+            'speed_limit': self.speed_limit,
+            'is_turning_lane': self.is_turning_lane,
+            'is_through_lane': self.is_through_lane,
+            'is_shared_lane': self.is_shared_lane,
+            'vehicle_count': self.vehicle_count,
+            'queue_length': self.queue_length,
+            'lane_group_id': self.lane_group_id,
+            'downstream_lanes': self.downstream_lanes
         }
     
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> 'OptimizationResult':
-        """Create an OptimizationResult from a dictionary."""
+    def from_dict(cls, data: Dict[str, Any]) -> 'Lane':
+        """Create from dictionary."""
         return cls(
-            cycle_length=data['cycle_length'],
-            phase_durations=data['phase_durations'],
-            phase_sequence=data['phase_sequence'],
-            offset=data.get('offset', 0.0),
-            performance_index=data.get('performance_index', 0.0),
-            delay_reduction=data.get('delay_reduction', 0.0),
-            optimization_method=data.get('optimization_method', ''),
-            timestamp=data.get('timestamp', time.time())
+            id=data['id'],
+            direction=LaneDirection(data['direction']),
+            length=data['length'],
+            width=data['width'],
+            speed_limit=data['speed_limit'],
+            is_turning_lane=data.get('is_turning_lane', False),
+            is_through_lane=data.get('is_through_lane', True),
+            is_shared_lane=data.get('is_shared_lane', False),
+            vehicle_count=data.get('vehicle_count', 0),
+            queue_length=data.get('queue_length', 0.0),
+            lane_group_id=data.get('lane_group_id'),
+            downstream_lanes=data.get('downstream_lanes', [])
         )
 
 
-class SignalOptimizer:
+@dataclass
+class Intersection:
     """
-    Base class for traffic signal optimization.
+    Represents a physical intersection with associated traffic control.
+    """
+    id: str
+    name: str
+    location: Tuple[float, float]  # (latitude, longitude)
+    controller: Optional[TrafficLightController] = None
+    lanes: Dict[str, Lane] = field(default_factory=dict)
+    upstream_intersections: Dict[str, float] = field(default_factory=dict)  # id -> distance (m)
+    downstream_intersections: Dict[str, float] = field(default_factory=dict)  # id -> distance (m)
+    is_critical: bool = False
+    coordination_speed: float = 40.0  # km/h
+    congestion_level: float = 0.0  # 0-1 scale
+    total_vehicles: int = 0
+    emergency_preemption_active: bool = False
+    
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary."""
+        return {
+            'id': self.id,
+            'name': self.name,
+            'location': self.location,
+            'lanes': {lane_id: lane.to_dict() for lane_id, lane in self.lanes.items()},
+            'upstream_intersections': self.upstream_intersections,
+            'downstream_intersections': self.downstream_intersections,
+            'is_critical': self.is_critical,
+            'coordination_speed': self.coordination_speed,
+            'congestion_level': self.congestion_level,
+            'total_vehicles': self.total_vehicles,
+            'emergency_preemption_active': self.emergency_preemption_active
+        }
+    
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any], controller: Optional[TrafficLightController] = None) -> 'Intersection':
+        """Create from dictionary."""
+        lanes = {}
+        if 'lanes' in data:
+            for lane_id, lane_data in data['lanes'].items():
+                lanes[lane_id] = Lane.from_dict(lane_data)
+        
+        return cls(
+            id=data['id'],
+            name=data['name'],
+            location=data['location'],
+            controller=controller,
+            lanes=lanes,
+            upstream_intersections=data.get('upstream_intersections', {}),
+            downstream_intersections=data.get('downstream_intersections', {}),
+            is_critical=data.get('is_critical', False),
+            coordination_speed=data.get('coordination_speed', 40.0),
+            congestion_level=data.get('congestion_level', 0.0),
+            total_vehicles=data.get('total_vehicles', 0),
+            emergency_preemption_active=data.get('emergency_preemption_active', False)
+        )
+    
+    def add_lane(self, lane: Lane) -> None:
+        """Add a lane to the intersection."""
+        self.lanes[lane.id] = lane
+    
+    def remove_lane(self, lane_id: str) -> bool:
+        """Remove a lane from the intersection."""
+        if lane_id in self.lanes:
+            del self.lanes[lane_id]
+            return True
+        return False
+    
+    def update_congestion(self, flow_data: Any) -> None:
+        """Update congestion level and vehicle counts from flow data."""
+        if hasattr(flow_data, 'density') and flow_data.density:
+            # Map density level to congestion value
+            density_map = {
+                'VERY_LOW': 0.0,
+                'LOW': 0.2,
+                'MODERATE': 0.4,
+                'HIGH': 0.6,
+                'VERY_HIGH': 0.8,
+                'CONGESTED': 1.0
+            }
+            
+            density_name = flow_data.density.name if hasattr(flow_data.density, 'name') else str(flow_data.density)
+            self.congestion_level = density_map.get(density_name, self.congestion_level)
+        
+        if hasattr(flow_data, 'vehicle_count'):
+            self.total_vehicles = flow_data.vehicle_count
+            
+            # Distribute vehicles among lanes (simplified)
+            lane_count = len(self.lanes)
+            if lane_count > 0:
+                vehicles_per_lane = self.total_vehicles // lane_count
+                remainder = self.total_vehicles % lane_count
+                
+                for i, lane_id in enumerate(self.lanes):
+                    self.lanes[lane_id].vehicle_count = vehicles_per_lane + (1 if i < remainder else 0)
+                    
+                    # Estimate queue length (very simplified)
+                    self.lanes[lane_id].queue_length = self.lanes[lane_id].vehicle_count * 7.0  # 7 meters per vehicle
+    
+    def add_upstream_intersection(self, intersection_id: str, distance: float) -> None:
+        """Add an upstream intersection with distance."""
+        self.upstream_intersections[intersection_id] = distance
+    
+    def add_downstream_intersection(self, intersection_id: str, distance: float) -> None:
+        """Add a downstream intersection with distance."""
+        self.downstream_intersections[intersection_id] = distance
+    
+    def set_emergency_preemption(self, active: bool, direction: Optional[LaneDirection] = None) -> None:
+        """Set emergency preemption state."""
+        self.emergency_preemption_active = active
+        
+        # Pass to controller if available
+        if self.controller:
+            direction_str = direction.value if direction else None
+            self.controller.emergency_preemption(active, direction_str)
+    
+    def get_travel_time_to(self, other_id: str) -> float:
+        """
+        Get travel time to another intersection.
+        
+        Args:
+            other_id: ID of the other intersection
+        
+        Returns:
+            Travel time in seconds or -1 if not connected
+        """
+        if other_id in self.downstream_intersections:
+            # Distance in meters, speed in km/h, convert to seconds
+            distance = self.downstream_intersections[other_id]
+            return distance / (self.coordination_speed * 1000 / 3600)
+        
+        if other_id in self.upstream_intersections:
+            # Distance in meters, speed in km/h, convert to seconds
+            distance = self.upstream_intersections[other_id]
+            return distance / (self.coordination_speed * 1000 / 3600)
+        
+        return -1.0  # Not directly connected
+    
+    def set_coordination_speed(self, speed: float) -> None:
+        """Set coordination speed in km/h."""
+        if speed <= 0:
+            raise ValueError("Coordination speed must be positive")
+        
+        self.coordination_speed = speed
+    
+    def get_lane_groups(self) -> Dict[str, List[Lane]]:
+        """
+        Get grouped lanes by lane_group_id.
+        
+        Returns:
+            Dictionary of lane_group_id -> list of Lanes
+        """
+        groups = defaultdict(list)
+        
+        for lane in self.lanes.values():
+            group_id = lane.lane_group_id or lane.direction.value
+            groups[group_id].append(lane)
+        
+        return dict(groups)
+    
+    def get_performance_metrics(self) -> Dict[str, Any]:
+        """
+        Get performance metrics for the intersection.
+        
+        Returns:
+            Dictionary of performance metrics
+        """
+        metrics = {
+            'id': self.id,
+            'name': self.name,
+            'congestion_level': self.congestion_level,
+            'total_vehicles': self.total_vehicles,
+            'upstream_count': len(self.upstream_intersections),
+            'downstream_count': len(self.downstream_intersections)
+        }
+        
+        # Add controller metrics if available
+        if self.controller:
+            controller_metrics = self.controller.get_performance_metrics()
+            metrics.update({f"controller_{k}": v for k, v in controller_metrics.items()})
+        
+        return metrics
+
+
+class IntersectionNetwork:
+    """
+    Manages a network of connected intersections.
     """
     
-    def __init__(
-        self,
-        min_cycle: float = 30.0,
-        max_cycle: float = 180.0,
-        lost_time_per_phase: float = 4.0,
-        target_v_c_ratio: float = 0.9,
-        update_interval: float = 300.0,
-        critical_intersection: bool = False
-    ):
-        """
-        Initialize signal optimizer.
+    def __init__(self):
+        """Initialize intersection network."""
+        self.intersections = {}  # id -> Intersection
+        self.critical_intersections = set()  # Set of critical intersection IDs
+        self.coordination_groups = {}  # group_id -> set of intersection IDs
+        self.network_cycle_length = 0.0  # Common cycle length
         
-        Args:
-            min_cycle: Minimum cycle length in seconds
-            max_cycle: Maximum cycle length in seconds
-            lost_time_per_phase: Lost time per phase in seconds
-            target_v_c_ratio: Target volume-to-capacity ratio
-            update_interval: Time between optimization updates in seconds
-            critical_intersection: Whether this is a critical intersection
-        """
-        self.min_cycle = min_cycle
-        self.max_cycle = max_cycle
-        self.lost_time_per_phase = lost_time_per_phase
-        self.target_v_c_ratio = target_v_c_ratio
-        self.update_interval = update_interval
-        self.critical_intersection = critical_intersection
+        # Cache for path finding
+        self.path_cache = {}  # (source, dest) -> path
         
-        # Internal state
-        self.last_update_time = 0.0
-        self.current_result = None
-        self.historical_results = []
+        # Network structure
+        self.adjacency_list = defaultdict(dict)  # id -> {neighbor_id -> distance}
         
-        logger.info(f"Signal optimizer initialized with min_cycle={min_cycle}, max_cycle={max_cycle}")
+        logger.info("Intersection network initialized")
     
-    def optimize(
-        self,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        current_timings: Dict[str, float],
-        coordination_data: Optional[Dict[str, Any]] = None
-    ) -> OptimizationResult:
+    def add_intersection(self, intersection: Intersection) -> None:
         """
-        Optimize signal timings based on current traffic conditions.
+        Add an intersection to the network.
         
         Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            current_timings: Dictionary of phase ID -> current duration
-            coordination_data: Optional data for coordination with adjacent intersections
+            intersection: Intersection to add
+        """
+        if intersection.id in self.intersections:
+            logger.warning(f"Replacing existing intersection: {intersection.id}")
+        
+        self.intersections[intersection.id] = intersection
+        
+        # Update adjacency list
+        for upstream_id, distance in intersection.upstream_intersections.items():
+            self.adjacency_list[intersection.id][upstream_id] = distance
+            self.adjacency_list[upstream_id][intersection.id] = distance
+        
+        for downstream_id, distance in intersection.downstream_intersections.items():
+            self.adjacency_list[intersection.id][downstream_id] = distance
+            self.adjacency_list[downstream_id][intersection.id] = distance
+        
+        # Mark as critical if needed
+        if intersection.is_critical:
+            self.critical_intersections.add(intersection.id)
+        
+        logger.info(f"Added intersection {intersection.id} to network")
+    
+    def remove_intersection(self, intersection_id: str) -> bool:
+        """
+        Remove an intersection from the network.
+        
+        Args:
+            intersection_id: ID of intersection to remove
         
         Returns:
-            OptimizationResult with optimized timings
+            True if intersection was removed, False if not found
         """
-        # Check if update is needed
-        current_time = time.time()
-        if current_time - self.last_update_time < self.update_interval and self.current_result:
-            logger.debug("Skipping optimization, using cached result")
-            return self.current_result
+        if intersection_id not in self.intersections:
+            return False
         
-        # Implement a basic optimization in the base class
-        # Specific optimization algorithms should be implemented in subclasses
+        # Remove from adjacency list
+        for neighbor in list(self.adjacency_list[intersection_id].keys()):
+            del self.adjacency_list[neighbor][intersection_id]
         
-        # Determine critical movements
-        critical_movements = self._find_critical_movements(movements, phases)
+        del self.adjacency_list[intersection_id]
         
-        # Calculate optimal cycle length
-        cycle_length = self._calculate_webster_cycle(critical_movements, phases)
+        # Remove from critical intersections
+        if intersection_id in self.critical_intersections:
+            self.critical_intersections.remove(intersection_id)
         
-        # Adjust to min/max bounds
-        cycle_length = max(self.min_cycle, min(self.max_cycle, cycle_length))
+        # Remove from coordination groups
+        for group_id, intersections in list(self.coordination_groups.items()):
+            if intersection_id in intersections:
+                intersections.remove(intersection_id)
+                if not intersections:
+                    del self.coordination_groups[group_id]
         
-        # Allocate green time proportionally
-        phase_durations = self._allocate_green_time(cycle_length, movements, phases, critical_movements)
+        # Remove the intersection
+        del self.intersections[intersection_id]
         
-        # Create phase sequence
-        phase_sequence = list(phases.keys())  # Default to same sequence
+        # Clear path cache
+        self.path_cache = {}
         
-        # Create optimization result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            optimization_method="webster",
-            performance_index=0.0,  # Placeholder, calculate actual PI in subclasses
-            delay_reduction=0.0      # Placeholder
-        )
-        
-        # Update internal state
-        self.last_update_time = current_time
-        self.current_result = result
-        self.historical_results.append(result)
-        
-        # Keep history limited
-        if len(self.historical_results) > 100:
-            self.historical_results = self.historical_results[-100:]
-        
-        logger.info(f"Optimized signal timing: cycle={cycle_length:.1f}s")
-        return result
+        logger.info(f"Removed intersection {intersection_id} from network")
+        return True
     
-    def _find_critical_movements(
-        self, 
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> Dict[str, List[str]]:
+    def add_connection(self, from_id: str, to_id: str, distance: float) -> bool:
         """
-        Find critical movements for each phase.
+        Add a connection between intersections.
         
         Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
+            from_id: Source intersection ID
+            to_id: Destination intersection ID
+            distance: Distance in meters
         
         Returns:
-            Dictionary of phase ID -> list of critical movement IDs
+            True if connection was added, False if any intersection was not found
         """
-        critical_movements = {}
+        if from_id not in self.intersections or to_id not in self.intersections:
+            return False
         
-        for phase_id, phase in phases.items():
-            if not phase.movements:
-                critical_movements[phase_id] = []
-                continue
-            
-            # Find movement with highest v/c ratio in this phase
-            max_flow_ratio = 0.0
-            critical_movement = None
-            
-            for movement_id in phase.movements:
-                if movement_id in movements:
-                    movement = movements[movement_id]
-                    if movement.saturation_flow > 0:
-                        flow_ratio = movement.demand.flow_rate / movement.saturation_flow
-                        if flow_ratio > max_flow_ratio:
-                            max_flow_ratio = flow_ratio
-                            critical_movement = movement_id
-            
-            critical_movements[phase_id] = [critical_movement] if critical_movement else []
+        # Update adjacency list
+        self.adjacency_list[from_id][to_id] = distance
+        self.adjacency_list[to_id][from_id] = distance
         
-        return critical_movements
+        # Update intersection connections
+        self.intersections[from_id].add_downstream_intersection(to_id, distance)
+        self.intersections[to_id].add_upstream_intersection(from_id, distance)
+        
+        # Clear path cache
+        self.path_cache = {}
+        
+        logger.info(f"Added connection: {from_id} -> {to_id} ({distance}m)")
+        return True
     
-    def _calculate_webster_cycle(
-        self,
-        critical_movements: Dict[str, List[str]],
-        phases: Dict[str, PhaseData]
-    ) -> float:
+    def remove_connection(self, from_id: str, to_id: str) -> bool:
         """
-        Calculate optimal cycle length using Webster's method.
+        Remove a connection between intersections.
         
         Args:
-            critical_movements: Dictionary of phase ID -> list of critical movement IDs
-            phases: Dictionary of phase ID -> PhaseData
+            from_id: Source intersection ID
+            to_id: Destination intersection ID
         
         Returns:
-            Optimal cycle length in seconds
+            True if connection was removed, False if not found
         """
-        # Calculate total lost time
-        total_lost_time = sum(
-            self.lost_time_per_phase for phase_id in phases if critical_movements.get(phase_id)
-        )
+        if from_id not in self.adjacency_list or to_id not in self.adjacency_list[from_id]:
+            return False
         
-        # Calculate sum of critical flow ratios
-        y_critical_sum = sum(
-            max(movement.demand.flow_rate / movement.saturation_flow 
-                for movement_id in critical_movements[phase_id]
-                for movement in [self.movements[movement_id]])
-            for phase_id in critical_movements
-            if critical_movements[phase_id] and critical_movements[phase_id][0] in self.movements
-        )
+        # Remove from adjacency list
+        del self.adjacency_list[from_id][to_id]
+        del self.adjacency_list[to_id][from_id]
         
-        # Handle case where y_critical_sum is too high or zero
-        if y_critical_sum >= 0.95 or y_critical_sum <= 0.0:
-            return self.max_cycle if y_critical_sum >= 0.95 else self.min_cycle
+        # Remove from intersection connections
+        if to_id in self.intersections[from_id].downstream_intersections:
+            del self.intersections[from_id].downstream_intersections[to_id]
         
-        # Webster's formula: C = (1.5L + 5) / (1 - Y)
-        # where L is total lost time and Y is sum of critical flow ratios
-        cycle_length = (1.5 * total_lost_time + 5) / (1 - y_critical_sum)
+        if from_id in self.intersections[to_id].upstream_intersections:
+            del self.intersections[to_id].upstream_intersections[from_id]
+        
+        # Clear path cache
+        self.path_cache = {}
+        
+        logger.info(f"Removed connection: {from_id} -> {to_id}")
+        return True
+    
+    def create_coordination_group(self, group_id: str, intersection_ids: List[str]) -> bool:
+        """
+        Create a coordination group.
+        
+        Args:
+            group_id: Group identifier
+            intersection_ids: List of intersection IDs in the group
+        
+        Returns:
+            True if group was created, False if any intersection was not found
+        """
+        # Verify all intersections exist
+        for intersection_id in intersection_ids:
+            if intersection_id not in self.intersections:
+                return False
+        
+        # Create group
+        self.coordination_groups[group_id] = set(intersection_ids)
+        
+        logger.info(f"Created coordination group {group_id} with {len(intersection_ids)} intersections")
+        return True
+    
+    def add_to_coordination_group(self, group_id: str, intersection_id: str) -> bool:
+        """
+        Add an intersection to a coordination group.
+        
+        Args:
+            group_id: Group identifier
+            intersection_id: Intersection ID to add
+        
+        Returns:
+            True if added, False if group doesn't exist or intersection not found
+        """
+        if group_id not in self.coordination_groups or intersection_id not in self.intersections:
+            return False
+        
+        self.coordination_groups[group_id].add(intersection_id)
+        logger.info(f"Added intersection {intersection_id} to coordination group {group_id}")
+        return True
+    
+    def calculate_network_cycle_length(self) -> float:
+        """
+        Calculate common cycle length for network coordination.
+        
+        Returns:
+            Calculated cycle length
+        """
+        # Strategy: Find the largest required cycle length among critical intersections
+        max_cycle = 0.0
+        
+        for intersection_id in self.critical_intersections:
+            if intersection_id in self.intersections:
+                intersection = self.intersections[intersection_id]
+                if intersection.controller and intersection.controller.current_result:
+                    cycle = intersection.controller.current_result.cycle_length
+                    max_cycle = max(max_cycle, cycle)
+        
+        # If no critical intersections, use average of all intersections
+        if max_cycle == 0:
+            cycles = []
+            for intersection in self.intersections.values():
+                if intersection.controller and intersection.controller.current_result:
+                    cycles.append(intersection.controller.current_result.cycle_length)
+            
+            if cycles:
+                max_cycle = sum(cycles) / len(cycles)
+        
+        # Use default if still no value
+        if max_cycle < 30:
+            max_cycle = 120.0
+        
+        # Round to nearest 5 seconds
+        cycle_length = round(max_cycle / 5) * 5
+        
+        # Store and return
+        self.network_cycle_length = cycle_length
+        logger.info(f"Calculated network cycle length: {cycle_length}s")
         
         return cycle_length
     
-    def _allocate_green_time(
-        self,
-        cycle_length: float,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        critical_movements: Dict[str, List[str]]
-    ) -> Dict[str, float]:
+    def optimize_coordination(self, group_id: Optional[str] = None) -> Dict[str, Any]:
         """
-        Allocate green time to phases based on critical movements.
+        Optimize signal coordination for a group or the entire network.
         
         Args:
-            cycle_length: Cycle length in seconds
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            critical_movements: Dictionary of phase ID -> list of critical movement IDs
+            group_id: Optional group identifier, if None, optimize all groups
         
         Returns:
-            Dictionary of phase ID -> duration
+            Dictionary with optimization results
         """
-        # Calculate effective green time (cycle length minus total lost time)
-        total_lost_time = sum(
-            self.lost_time_per_phase for phase_id in phases if critical_movements.get(phase_id)
-        )
-        effective_green = cycle_length - total_lost_time
+        # Calculate common cycle length
+        cycle_length = self.calculate_network_cycle_length()
         
-        # Calculate sum of critical flow ratios
-        y_critical_values = {}
-        y_critical_sum = 0.0
+        # Groups to optimize
+        groups_to_optimize = []
         
-        for phase_id, critical_ids in critical_movements.items():
-            if not critical_ids:
-                y_critical_values[phase_id] = 0.0
-                continue
-            
-            critical_id = critical_ids[0]
-            if critical_id in movements:
-                movement = movements[critical_id]
-                if movement.saturation_flow > 0:
-                    y_critical = movement.demand.flow_rate / movement.saturation_flow
-                    y_critical_values[phase_id] = y_critical
-                    y_critical_sum += y_critical
-                else:
-                    y_critical_values[phase_id] = 0.0
-            else:
-                y_critical_values[phase_id] = 0.0
-        
-        # Allocate green time proportionally to critical flow ratios
-        phase_durations = {}
-        
-        for phase_id, phase in phases.items():
-            if y_critical_sum > 0 and phase_id in y_critical_values:
-                # Calculate green time proportionally
-                green_ratio = y_critical_values[phase_id] / y_critical_sum if y_critical_sum > 0 else 0
-                green_time = effective_green * green_ratio
-                
-                # Add lost time components
-                phase_duration = green_time + phase.yellow + phase.red_clearance
-                
-                # Apply min/max constraints
-                phase_duration = max(phase.min_green + phase.yellow + phase.red_clearance, 
-                                    min(phase.max_green + phase.yellow + phase.red_clearance, 
-                                        phase_duration))
-                
-                phase_durations[phase_id] = phase_duration
-            else:
-                # Assign minimum green time for phases without critical movements
-                phase_durations[phase_id] = phase.min_green + phase.yellow + phase.red_clearance
-        
-        # Normalize durations to match cycle length
-        total_duration = sum(phase_durations.values())
-        if total_duration > 0:
-            scale_factor = cycle_length / total_duration
-            for phase_id in phase_durations:
-                phase_durations[phase_id] *= scale_factor
-        
-        return phase_durations
-    
-    def _calculate_performance_index(
-        self,
-        cycle_length: float,
-        phase_durations: Dict[str, float],
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> float:
-        """
-        Calculate performance index for optimization result.
-        
-        Args:
-            cycle_length: Cycle length in seconds
-            phase_durations: Dictionary of phase ID -> duration
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Performance index value (lower is better)
-        """
-        # Base performance index on total delay
-        total_delay = 0.0
-        total_vehicles = 0
-        
-        for movement_id, movement in movements.items():
-            # Find phase containing this movement
-            phase_id = next((pid for pid, phase in phases.items() 
-                           if movement_id in phase.movements), None)
-            
-            if not phase_id:
-                continue
-            
-            # Calculate green time for this movement
-            green_time = phase_durations[phase_id] - phases[phase_id].yellow - phases[phase_id].red_clearance
-            
-            # Calculate capacity
-            capacity = movement.saturation_flow * green_time / cycle_length
-            
-            # Calculate delay using Webster's delay formula
-            x = min(0.99, movement.demand.flow_rate / max(1, capacity))  # v/c ratio capped at 0.99
-            
-            delay_term1 = cycle_length * (1 - green_time/cycle_length)**2 / (2 * (1 - x * green_time/cycle_length))
-            delay_term2 = x**2 / (2 * movement.demand.flow_rate * (1 - x))
-            
-            avg_delay = 0.9 * (delay_term1 + delay_term2)  # Scale factor for calibration
-            
-            # Add to total delay
-            movement_vehicles = movement.demand.count
-            total_delay += avg_delay * movement_vehicles
-            total_vehicles += movement_vehicles
-        
-        # Calculate average delay per vehicle as performance index
-        if total_vehicles > 0:
-            performance_index = total_delay / total_vehicles
+        if group_id:
+            if group_id in self.coordination_groups:
+                groups_to_optimize.append((group_id, self.coordination_groups[group_id]))
         else:
-            performance_index = 0.0
+            groups_to_optimize = list(self.coordination_groups.items())
         
-        return performance_index
-    
-    def get_historical_results(self) -> List[OptimizationResult]:
-        """
-        Get historical optimization results.
-        
-        Returns:
-            List of historical OptimizationResult objects
-        """
-        return self.historical_results
-    
-    def analyze_performance(self) -> Dict[str, Any]:
-        """
-        Analyze performance of current optimization.
-        
-        Returns:
-            Dictionary with performance analysis
-        """
-        if not self.historical_results:
-            return {'status': 'No optimization history available'}
-        
-        # Get latest and historical results
-        latest = self.historical_results[-1]
-        
-        # Calculate statistics from historical data
-        cycle_lengths = [result.cycle_length for result in self.historical_results]
-        avg_cycle = sum(cycle_lengths) / len(cycle_lengths)
-        min_cycle = min(cycle_lengths)
-        max_cycle = max(cycle_lengths)
-        
-        # Analyze phase durations
-        phase_stats = {}
-        for phase_id in latest.phase_durations:
-            phase_durations = [result.phase_durations.get(phase_id, 0) for result in self.historical_results 
-                              if phase_id in result.phase_durations]
-            
-            if phase_durations:
-                phase_stats[phase_id] = {
-                    'avg': sum(phase_durations) / len(phase_durations),
-                    'min': min(phase_durations),
-                    'max': max(phase_durations),
-                    'current': latest.phase_durations[phase_id]
-                }
-        
-        # Create analysis report
-        return {
-            'status': 'OK',
-            'optimization_method': latest.optimization_method,
-            'current_cycle': latest.cycle_length,
-            'avg_cycle': avg_cycle,
-            'min_cycle': min_cycle,
-            'max_cycle': max_cycle,
-            'cycle_stability': 1.0 - (max_cycle - min_cycle) / max(1.0, avg_cycle),  # Higher is more stable
-            'phase_stats': phase_stats,
-            'latest_performance_index': latest.performance_index,
-            'latest_delay_reduction': latest.delay_reduction,
-            'update_frequency': len(self.historical_results) / 
-                               (self.historical_results[-1].timestamp - self.historical_results[0].timestamp 
-                                if len(self.historical_results) > 1 else 1.0)
-        }
-
-
-class FixedTimeOptimizer(SignalOptimizer):
-    """
-    Fixed-time signal optimizer using Webster's method.
-    """
-    
-    def __init__(
-        self,
-        min_cycle: float = 30.0,
-        max_cycle: float = 120.0,
-        lost_time_per_phase: float = 4.0,
-        target_v_c_ratio: float = 0.9,
-        update_interval: float = 1800.0,  # 30 minutes between updates
-        critical_intersection: bool = False,
-        periodic_update: bool = True
-    ):
-        """
-        Initialize fixed-time optimizer.
-        
-        Args:
-            min_cycle: Minimum cycle length in seconds
-            max_cycle: Maximum cycle length in seconds
-            lost_time_per_phase: Lost time per phase in seconds
-            target_v_c_ratio: Target volume-to-capacity ratio
-            update_interval: Time between optimization updates in seconds
-            critical_intersection: Whether this is a critical intersection
-            periodic_update: Whether to update timings periodically
-        """
-        super().__init__(
-            min_cycle=min_cycle,
-            max_cycle=max_cycle,
-            lost_time_per_phase=lost_time_per_phase,
-            target_v_c_ratio=target_v_c_ratio,
-            update_interval=update_interval,
-            critical_intersection=critical_intersection
-        )
-        self.periodic_update = periodic_update
-        self.movements = {}  # Cache for movements
-        
-        logger.info("Fixed-time signal optimizer initialized")
-    
-    def optimize(
-        self,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        current_timings: Dict[str, float],
-        coordination_data: Optional[Dict[str, Any]] = None
-    ) -> OptimizationResult:
-        """
-        Optimize signal timings using Webster's method.
-        
-        Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            current_timings: Dictionary of phase ID -> current duration
-            coordination_data: Optional data for coordination with adjacent intersections
-        
-        Returns:
-            OptimizationResult with optimized timings
-        """
-        # Check if update is needed
-        current_time = time.time()
-        if self.periodic_update and current_time - self.last_update_time < self.update_interval and self.current_result:
-            logger.debug("Skipping optimization, using cached result")
-            return self.current_result
-        
-        # Cache movements for use in internal methods
-        self.movements = movements
-        
-        # Find critical movements
-        critical_movements = self._find_critical_movements(movements, phases)
-        
-        # Calculate optimal cycle length
-        cycle_length = self._calculate_webster_cycle(critical_movements, phases)
-        
-        # Adjust to min/max bounds
-        cycle_length = max(self.min_cycle, min(self.max_cycle, cycle_length))
-        
-        # Allocate green time proportionally
-        phase_durations = self._allocate_green_time(cycle_length, movements, phases, critical_movements)
-        
-        # Create phase sequence - fixed time uses the same sequence
-        phase_sequence = list(phases.keys())
-        
-        # Calculate performance index
-        performance_index = self._calculate_performance_index(cycle_length, phase_durations, movements, phases)
-        
-        # Calculate delay reduction
-        delay_reduction = self._calculate_delay_reduction(cycle_length, phase_durations, 
-                                                        current_timings, movements, phases)
-        
-        # Process coordination if provided
-        offset = 0.0
-        if coordination_data and coordination_data.get('enabled', False):
-            offset = self._calculate_coordination_offset(cycle_length, phase_durations, 
-                                                         coordination_data, movements, phases)
-        
-        # Create optimization result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            offset=offset,
-            optimization_method="webster_fixed",
-            performance_index=performance_index,
-            delay_reduction=delay_reduction
-        )
-        
-        # Update internal state
-        self.last_update_time = current_time
-        self.current_result = result
-        self.historical_results.append(result)
-        
-        # Keep history limited
-        if len(self.historical_results) > 100:
-            self.historical_results = self.historical_results[-100:]
-        
-        logger.info(f"Fixed-time optimization: cycle={cycle_length:.1f}s, PI={performance_index:.2f}")
-        return result
-    
-    def _calculate_delay_reduction(
-        self,
-        cycle_length: float,
-        phase_durations: Dict[str, float],
-        current_timings: Dict[str, float],
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> float:
-        """
-        Calculate delay reduction compared to current timings.
-        
-        Args:
-            cycle_length: Optimized cycle length in seconds
-            phase_durations: Dictionary of phase ID -> optimized duration
-            current_timings: Dictionary of phase ID -> current duration
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Delay reduction percentage (0-100)
-        """
-        # Calculate current cycle length
-        current_cycle = sum(current_timings.values())
-        
-        # Calculate delay with current timings
-        current_pi = self._calculate_performance_index(current_cycle, current_timings, movements, phases)
-        
-        # Calculate delay with optimized timings
-        optimized_pi = self._calculate_performance_index(cycle_length, phase_durations, movements, phases)
-        
-        # Calculate reduction percentage
-        if current_pi > 0:
-            delay_reduction = max(0, (current_pi - optimized_pi) / current_pi * 100)
-        else:
-            delay_reduction = 0.0
-        
-        return delay_reduction
-    
-    def _calculate_coordination_offset(
-        self,
-        cycle_length: float,
-        phase_durations: Dict[str, float],
-        coordination_data: Dict[str, Any],
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> float:
-        """
-        Calculate signal offset for coordination.
-        
-        Args:
-            cycle_length: Optimized cycle length in seconds
-            phase_durations: Dictionary of phase ID -> optimized duration
-            coordination_data: Coordination data
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Offset value in seconds
-        """
-        # Get coordination parameters
-        travel_time = coordination_data.get('travel_time', 0.0)
-        reference_offset = coordination_data.get('reference_offset', 0.0)
-        direction = coordination_data.get('direction', 'two_way')
-        
-        # Identify coordinated phase
-        coordinated_phase = next((phase_id for phase_id, phase in phases.items() 
-                                if phase.is_coordinated), None)
-        
-        if not coordinated_phase:
-            return 0.0
-        
-        # Calculate offset
-        if direction == 'one_way':
-            # One-way coordination: offset = travel time
-            offset = travel_time % cycle_length
-        else:
-            # Two-way coordination: offset = half cycle
-            offset = (cycle_length / 2) % cycle_length
-        
-        # Adjust for reference offset
-        offset = (offset + reference_offset) % cycle_length
-        
-        return offset
-
-
-class AdaptiveOptimizer(SignalOptimizer):
-    """
-    Adaptive signal optimizer that responds to real-time traffic conditions.
-    """
-    
-    def __init__(
-        self,
-        min_cycle: float = 30.0,
-        max_cycle: float = 150.0,
-        lost_time_per_phase: float = 4.0,
-        target_v_c_ratio: float = 0.9,
-        update_interval: float = 180.0,  # 3 minutes between updates
-        critical_intersection: bool = False,
-        adaptation_rate: float = 0.3,
-        queue_weight: float = 0.5,
-        historical_weight: float = 0.2,
-        min_green_extension: float = 2.0,
-        max_green_extension: float = 20.0
-    ):
-        """
-        Initialize adaptive optimizer.
-        
-        Args:
-            min_cycle: Minimum cycle length in seconds
-            max_cycle: Maximum cycle length in seconds
-            lost_time_per_phase: Lost time per phase in seconds
-            target_v_c_ratio: Target volume-to-capacity ratio
-            update_interval: Time between optimization updates in seconds
-            critical_intersection: Whether this is a critical intersection
-            adaptation_rate: Rate of adaptation to new conditions (0-1)
-            queue_weight: Weight for queue length in decision making
-            historical_weight: Weight for historical patterns
-            min_green_extension: Minimum green extension time
-            max_green_extension: Maximum green extension time
-        """
-        super().__init__(
-            min_cycle=min_cycle,
-            max_cycle=max_cycle,
-            lost_time_per_phase=lost_time_per_phase,
-            target_v_c_ratio=target_v_c_ratio,
-            update_interval=update_interval,
-            critical_intersection=critical_intersection
-        )
-        self.adaptation_rate = adaptation_rate
-        self.queue_weight = queue_weight
-        self.historical_weight = historical_weight
-        self.min_green_extension = min_green_extension
-        self.max_green_extension = max_green_extension
-        
-        # Historical data for adaptation
-        self.historical_demands = {}  # time_of_day -> movement_id -> demand
-        self.historical_timings = {}  # time_of_day -> cycle_length, phase_durations
-        self.movements = {}  # Cache for movements
-        
-        # Store past demand data
-        self.past_demands = []  # List of (timestamp, movement_id, demand) tuples
-        
-        logger.info("Adaptive signal optimizer initialized")
-    
-    def optimize(
-        self,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        current_timings: Dict[str, float],
-        coordination_data: Optional[Dict[str, Any]] = None
-    ) -> OptimizationResult:
-        """
-        Optimize signal timings using adaptive approach.
-        
-        Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            current_timings: Dictionary of phase ID -> current duration
-            coordination_data: Optional data for coordination with adjacent intersections
-        
-        Returns:
-            OptimizationResult with optimized timings
-        """
-        # Cache movements for use in internal methods
-        self.movements = movements
-        
-        # Get current time of day
-        current_time = time.time()
-        time_of_day = datetime.datetime.now().strftime("%H:%M")
-        
-        # Update historical data
-        self._update_historical_data(time_of_day, movements, current_timings)
-        
-        # Find critical movements
-        critical_movements = self._find_critical_movements(movements, phases)
-        
-        # Calculate base cycle length using Webster's method
-        base_cycle = self._calculate_webster_cycle(critical_movements, phases)
-        
-        # Adjust cycle length based on historical patterns
-        historical_cycle = self._get_historical_cycle(time_of_day)
-        
-        # Blend current and historical cycles
-        if historical_cycle > 0:
-            cycle_length = (1 - self.historical_weight) * base_cycle + self.historical_weight * historical_cycle
-        else:
-            cycle_length = base_cycle
-        
-        # Adjust to min/max bounds
-        cycle_length = max(self.min_cycle, min(self.max_cycle, cycle_length))
-        
-        # Allocate green time proportionally but consider queues
-        phase_durations = self._adaptive_green_allocation(cycle_length, movements, phases, critical_movements)
-        
-        # Create phase sequence - may reorder phases based on demand
-        phase_sequence = self._optimize_phase_sequence(phases, movements)
-        
-        # Calculate performance index
-        performance_index = self._calculate_performance_index(cycle_length, phase_durations, movements, phases)
-        
-        # Calculate delay reduction
-        delay_reduction = self._calculate_delay_reduction(cycle_length, phase_durations, 
-                                                        current_timings, movements, phases)
-        
-        # Process coordination if provided
-        offset = 0.0
-        if coordination_data and coordination_data.get('enabled', False):
-            offset = self._calculate_coordination_offset(cycle_length, phase_durations, 
-                                                         coordination_data, movements, phases)
-        
-        # Create optimization result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            offset=offset,
-            optimization_method="adaptive",
-            performance_index=performance_index,
-            delay_reduction=delay_reduction
-        )
-        
-        # Adapt to current result based on adaptation rate
-        if self.current_result:
-            # Blend previous and current results
-            blended_result = self._blend_results(self.current_result, result)
-            result = blended_result
-        
-        # Update internal state
-        self.last_update_time = current_time
-        self.current_result = result
-        self.historical_results.append(result)
-        
-        # Keep history limited
-        if len(self.historical_results) > 100:
-            self.historical_results = self.historical_results[-100:]
-        
-        logger.info(f"Adaptive optimization: cycle={cycle_length:.1f}s, PI={performance_index:.2f}")
-        return result
-    
-    def _update_historical_data(
-        self,
-        time_of_day: str,
-        movements: Dict[str, MovementData],
-        current_timings: Dict[str, float]
-    ):
-        """
-        Update historical data for time of day.
-        
-        Args:
-            time_of_day: Current time of day (HH:MM format)
-            movements: Dictionary of movement ID -> MovementData
-            current_timings: Dictionary of phase ID -> current duration
-        """
-        # Round time to nearest 15 minutes for binning
-        hour, minute = map(int, time_of_day.split(':'))
-        minute = (minute // 15) * 15
-        time_bin = f"{hour:02d}:{minute:02d}"
-        
-        # Initialize time bin if not exists
-        if time_bin not in self.historical_demands:
-            self.historical_demands[time_bin] = {}
-        
-        if time_bin not in self.historical_timings:
-            self.historical_timings[time_bin] = {
-                'cycle_length': sum(current_timings.values()),
-                'phase_durations': current_timings.copy(),
-                'count': 0
-            }
-        
-        # Update movement demands
-        for movement_id, movement in movements.items():
-            if movement_id not in self.historical_demands[time_bin]:
-                self.historical_demands[time_bin][movement_id] = {
-                    'count': 0,
-                    'flow_rate': 0,
-                    'queue_length': 0
-                }
-            
-            # Update with exponential moving average
-            hist = self.historical_demands[time_bin][movement_id]
-            alpha = 1.0 / (hist['count'] + 1) if hist['count'] < 10 else 0.1  # Adaptation rate
-            
-            hist['flow_rate'] = (1 - alpha) * hist['flow_rate'] + alpha * movement.demand.flow_rate
-            hist['queue_length'] = (1 - alpha) * hist['queue_length'] + alpha * movement.demand.queue_length
-            hist['count'] += 1
-        
-        # Update timing history
-        hist_timing = self.historical_timings[time_bin]
-        cycle_length = sum(current_timings.values())
-        
-        # Update with exponential moving average
-        alpha = 1.0 / (hist_timing['count'] + 1) if hist_timing['count'] < 10 else 0.1
-        
-        hist_timing['cycle_length'] = (1 - alpha) * hist_timing['cycle_length'] + alpha * cycle_length
-        
-        for phase_id, duration in current_timings.items():
-            if phase_id not in hist_timing['phase_durations']:
-                hist_timing['phase_durations'][phase_id] = duration
-            else:
-                hist_timing['phase_durations'][phase_id] = (
-                    (1 - alpha) * hist_timing['phase_durations'][phase_id] + alpha * duration
-                )
-        
-        hist_timing['count'] += 1
-        
-        # Store demand data for time-series analysis
-        timestamp = time.time()
-        for movement_id, movement in movements.items():
-            self.past_demands.append((timestamp, movement_id, {
-                'flow_rate': movement.demand.flow_rate,
-                'queue_length': movement.demand.queue_length,
-                'time_of_day': time_of_day
-            }))
-        
-        # Keep history limited
-        if len(self.past_demands) > 1000:
-            self.past_demands = self.past_demands[-1000:]
-    
-    def _get_historical_cycle(self, time_of_day: str) -> float:
-        """
-        Get historical cycle length for time of day.
-        
-        Args:
-            time_of_day: Current time of day (HH:MM format)
-        
-        Returns:
-            Historical cycle length or 0 if no history
-        """
-        # Round time to nearest 15 minutes for binning
-        hour, minute = map(int, time_of_day.split(':'))
-        minute = (minute // 15) * 15
-        time_bin = f"{hour:02d}:{minute:02d}"
-        
-        if time_bin in self.historical_timings:
-            return self.historical_timings[time_bin]['cycle_length']
-        
-        # Try adjacent time bins if exact match not found
-        adjacent_bins = []
-        
-        # Previous 15-minute bin
-        prev_minute = minute - 15
-        prev_hour = hour
-        if prev_minute < 0:
-            prev_minute = 45
-            prev_hour = (hour - 1) % 24
-        adjacent_bins.append(f"{prev_hour:02d}:{prev_minute:02d}")
-        
-        # Next 15-minute bin
-        next_minute = minute + 15
-        next_hour = hour
-        if next_minute >= 60:
-            next_minute = 0
-            next_hour = (hour + 1) % 24
-        adjacent_bins.append(f"{next_hour:02d}:{next_minute:02d}")
-        
-        # Check adjacent bins
-        for bin_time in adjacent_bins:
-            if bin_time in self.historical_timings:
-                return self.historical_timings[bin_time]['cycle_length']
-        
-        return 0.0  # No historical data found
-    
-    def _adaptive_green_allocation(
-        self,
-        cycle_length: float,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        critical_movements: Dict[str, List[str]]
-    ) -> Dict[str, float]:
-        """
-        Allocate green time adaptively based on flow and queues.
-        
-        Args:
-            cycle_length: Cycle length in seconds
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            critical_movements: Dictionary of phase ID -> list of critical movement IDs
-        
-        Returns:
-            Dictionary of phase ID -> duration
-        """
-        # Calculate lost time
-        total_lost_time = sum(
-            phase.yellow + phase.red_clearance for phase in phases.values()
-        )
-        
-        # Calculate effective green time
-        effective_green = cycle_length - total_lost_time
-        
-        # Calculate base green times using flow ratios
-        flow_green_times = {}
-        total_flow_ratio = 0.0
-        
-        for phase_id, phase in phases.items():
-            # Calculate flow ratio for this phase
-            phase_flow_ratio = 0.0
-            
-            for movement_id in phase.movements:
-                if movement_id in movements:
-                    movement = movements[movement_id]
-                    if movement.saturation_flow > 0:
-                        flow_ratio = movement.demand.flow_rate / movement.saturation_flow
-                        phase_flow_ratio = max(phase_flow_ratio, flow_ratio)
-            
-            flow_green_times[phase_id] = phase_flow_ratio
-            total_flow_ratio += phase_flow_ratio
-        
-        # Normalize flow ratios to allocate green time
-        if total_flow_ratio > 0:
-            for phase_id in flow_green_times:
-                flow_green_times[phase_id] = (
-                    effective_green * flow_green_times[phase_id] / total_flow_ratio
-                )
-        
-        # Calculate queue-based green times
-        queue_green_times = {}
-        total_queue_length = 0.0
-        
-        for phase_id, phase in phases.items():
-            # Calculate total queue for this phase
-            phase_queue = 0.0
-            
-            for movement_id in phase.movements:
-                if movement_id in movements:
-                    phase_queue += movements[movement_id].demand.queue_length
-            
-            queue_green_times[phase_id] = phase_queue
-            total_queue_length += phase_queue
-        
-        # Normalize queue lengths to allocate green time
-        if total_queue_length > 0:
-            for phase_id in queue_green_times:
-                queue_green_times[phase_id] = (
-                    effective_green * queue_green_times[phase_id] / total_queue_length
-                )
-        
-        # Blend flow-based and queue-based allocations
-        phase_durations = {}
-        
-        for phase_id, phase in phases.items():
-            # Blend allocations using queue weight
-            green_time = (
-                (1 - self.queue_weight) * flow_green_times.get(phase_id, 0) +
-                self.queue_weight * queue_green_times.get(phase_id, 0)
-            )
-            
-            # Add yellow and red clearance
-            duration = green_time + phase.yellow + phase.red_clearance
-            
-            # Apply min/max constraints
-            min_duration = phase.min_green + phase.yellow + phase.red_clearance
-            max_duration = phase.max_green + phase.yellow + phase.red_clearance
-            
-            duration = max(min_duration, min(max_duration, duration))
-            
-            phase_durations[phase_id] = duration
-        
-        # Normalize durations to match cycle length
-        total_duration = sum(phase_durations.values())
-        if total_duration > 0:
-            scale_factor = cycle_length / total_duration
-            for phase_id in phase_durations:
-                phase_durations[phase_id] *= scale_factor
-        
-        return phase_durations
-    
-    def _optimize_phase_sequence(
-        self,
-        phases: Dict[str, PhaseData],
-        movements: Dict[str, MovementData]
-    ) -> List[str]:
-        """
-        Optimize phase sequence based on demand.
-        
-        Args:
-            phases: Dictionary of phase ID -> PhaseData
-            movements: Dictionary of movement ID -> MovementData
-        
-        Returns:
-            Optimized list of phase IDs
-        """
-        # Default to original sequence
-        default_sequence = list(phases.keys())
-        
-        # For adaptive control, we might want to prioritize phases with higher demand
-        # However, changing sequence too often can disrupt traffic flow
-        # So we prioritize but maintain compatibility with coordination
-        
-        # Calculate demand score for each phase
-        phase_scores = {}
-        
-        for phase_id, phase in phases.items():
-            # Base score on total flow and queue length
-            flow_sum = 0.0
-            queue_sum = 0.0
-            
-            for movement_id in phase.movements:
-                if movement_id in movements:
-                    flow_sum += movements[movement_id].demand.flow_rate
-                    queue_sum += movements[movement_id].demand.queue_length
-            
-            # Combine into score, weighted by queue
-            score = (1 - self.queue_weight) * flow_sum + self.queue_weight * queue_sum
-            
-            # Prioritize coordinated phases
-            if phase.is_coordinated:
-                score *= 1.5
-            
-            # Apply priority multiplier
-            score *= phase.priority
-            
-            phase_scores[phase_id] = score
-        
-        # For non-coordinated phases, sort by score
-        coord_phases = [p_id for p_id, p in phases.items() if p.is_coordinated]
-        non_coord_phases = [p_id for p_id in default_sequence if p_id not in coord_phases]
-        
-        # Sort non-coordinated phases by score
-        non_coord_phases.sort(key=lambda p_id: phase_scores.get(p_id, 0), reverse=True)
-        
-        # Rebuild sequence maintaining coordinated phases in original positions
-        optimized_sequence = []
-        non_coord_index = 0
-        
-        for phase_id in default_sequence:
-            if phase_id in coord_phases:
-                optimized_sequence.append(phase_id)
-            else:
-                if non_coord_index < len(non_coord_phases):
-                    optimized_sequence.append(non_coord_phases[non_coord_index])
-                    non_coord_index += 1
-        
-        return optimized_sequence
-    
-    def _blend_results(
-        self,
-        previous: OptimizationResult,
-        current: OptimizationResult
-    ) -> OptimizationResult:
-        """
-        Blend previous and current optimization results.
-        
-        Args:
-            previous: Previous optimization result
-            current: Current optimization result
-        
-        Returns:
-            Blended OptimizationResult
-        """
-        # Blend cycle length
-        cycle_length = (
-            (1 - self.adaptation_rate) * previous.cycle_length +
-            self.adaptation_rate * current.cycle_length
-        )
-        
-        # Blend phase durations
-        phase_durations = {}
-        all_phases = set(list(previous.phase_durations.keys()) + list(current.phase_durations.keys()))
-        
-        for phase_id in all_phases:
-            prev_duration = previous.phase_durations.get(phase_id, 0)
-            curr_duration = current.phase_durations.get(phase_id, 0)
-            
-            if prev_duration == 0:
-                # New phase, use current duration
-                phase_durations[phase_id] = curr_duration
-            elif curr_duration == 0:
-                # Removed phase, use zero
-                phase_durations[phase_id] = 0
-            else:
-                # Blend durations
-                phase_durations[phase_id] = (
-                    (1 - self.adaptation_rate) * prev_duration +
-                    self.adaptation_rate * curr_duration
-                )
-        
-        # Use the current phase sequence
-        phase_sequence = current.phase_sequence
-        
-        # Blend offset
-        offset = (
-            (1 - self.adaptation_rate) * previous.offset +
-            self.adaptation_rate * current.offset
-        )
-        
-        # Use the better performance index
-        performance_index = min(previous.performance_index, current.performance_index)
-        
-        # Use the current delay reduction
-        delay_reduction = current.delay_reduction
-        
-        # Create blended result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            offset=offset,
-            optimization_method="adaptive_blended",
-            performance_index=performance_index,
-            delay_reduction=delay_reduction
-        )
-        
-        return result
-    
-    def calculate_green_extension(
-        self,
-        phase_id: str,
-        current_green_time: float,
-        vehicles_in_dilemma_zone: int,
-        seconds_since_last_call: float
-    ) -> float:
-        """
-        Calculate green extension time for adaptive control.
-        
-        Args:
-            phase_id: Current phase ID
-            current_green_time: Current green time so far
-            vehicles_in_dilemma_zone: Number of vehicles in dilemma zone
-            seconds_since_last_call: Seconds since last vehicle call
-        
-        Returns:
-            Extension time in seconds or 0 if no extension
-        """
-        if not self.current_result:
-            return 0.0
-        
-        # Get max green time for this phase
-        phase_max_green = 0.0
-        for phase_id_result, duration in self.current_result.phase_durations.items():
-            if phase_id_result == phase_id and phase_id in self.movements:
-                # Assume yellow and red clearance take about 20% of phase
-                phase_max_green = duration * 0.8
-                break
-        
-        # If we've exceeded max green, don't extend
-        if current_green_time >= phase_max_green:
-            return 0.0
-        
-        # Calculate extension based on vehicles in dilemma zone
-        if vehicles_in_dilemma_zone > 0:
-            # Extend based on number of vehicles
-            extension = min(self.max_green_extension, 
-                            vehicles_in_dilemma_zone * self.min_green_extension)
-            
-            # Limit extension to not exceed max green
-            return min(extension, phase_max_green - current_green_time)
-        
-        # If gap is too large, don't extend
-        if seconds_since_last_call > 2.0:
-            return 0.0
-        
-        # Default small extension
-        return min(self.min_green_extension, phase_max_green - current_green_time)
-    
-    def analyze_traffic_patterns(self) -> Dict[str, Any]:
-        """
-        Analyze historical traffic patterns.
-        
-        Returns:
-            Dictionary with traffic pattern analysis
-        """
-        if not self.past_demands:
-            return {'status': 'No historical data available'}
-        
-        # Group by time of day and movement
-        time_patterns = defaultdict(lambda: defaultdict(list))
-        movement_patterns = defaultdict(list)
-        
-        for timestamp, movement_id, demand in self.past_demands:
-            # Extract hour
-            time_of_day = demand['time_of_day']
-            hour = int(time_of_day.split(':')[0])
-            
-            # Add to time patterns
-            time_patterns[hour][movement_id].append(demand['flow_rate'])
-            
-            # Add to movement patterns
-            movement_patterns[movement_id].append((timestamp, demand['flow_rate']))
-        
-        # Calculate hourly averages
-        hourly_averages = {}
-        for hour, movements in time_patterns.items():
-            hourly_averages[hour] = {}
-            for movement_id, flow_rates in movements.items():
-                hourly_averages[hour][movement_id] = sum(flow_rates) / len(flow_rates)
-        
-        # Identify peak hours
-        total_hourly_flow = {hour: sum(avgs.values()) for hour, avgs in hourly_averages.items()}
-        peak_hours = sorted(total_hourly_flow.keys(), key=lambda h: total_hourly_flow[h], reverse=True)[:3]
-        
-        # Identify critical movements
-        movement_averages = {m_id: sum(flow for _, flow in flows) / len(flows) 
-                            for m_id, flows in movement_patterns.items()}
-        critical_movements = sorted(movement_averages.keys(), 
-                                   key=lambda m: movement_averages[m], reverse=True)[:3]
-        
-        # Create analysis report
-        return {
-            'status': 'OK',
-            'peak_hours': peak_hours,
-            'peak_hour_flows': {hour: total_hourly_flow[hour] for hour in peak_hours},
-            'critical_movements': critical_movements,
-            'critical_movement_flows': {m_id: movement_averages[m_id] for m_id in critical_movements},
-            'data_points': len(self.past_demands),
-            'time_coverage_hours': (self.past_demands[-1][0] - self.past_demands[0][0]) / 3600.0
-        }
-
-
-class PredictiveOptimizer(SignalOptimizer):
-    """
-    Predictive signal optimizer that forecasts traffic patterns.
-    """
-    
-    def __init__(
-        self,
-        min_cycle: float = 30.0,
-        max_cycle: float = 150.0,
-        lost_time_per_phase: float = 4.0,
-        target_v_c_ratio: float = 0.9,
-        update_interval: float = 300.0,  # 5 minutes between updates
-        critical_intersection: bool = False,
-        prediction_horizon: int = 3,  # Prediction steps ahead
-        historical_periods: int = 7,  # Days of historical data to use
-        seasonal_patterns: bool = True,  # Consider time-of-day and day-of-week
-        use_ml_model: bool = False,  # Use machine learning model for prediction
-        prediction_weight: float = 0.5  # Weight of prediction vs current conditions
-    ):
-        """
-        Initialize predictive optimizer.
-        
-        Args:
-            min_cycle: Minimum cycle length in seconds
-            max_cycle: Maximum cycle length in seconds
-            lost_time_per_phase: Lost time per phase in seconds
-            target_v_c_ratio: Target volume-to-capacity ratio
-            update_interval: Time between optimization updates in seconds
-            critical_intersection: Whether this is a critical intersection
-            prediction_horizon: Number of time steps to predict ahead
-            historical_periods: Number of historical periods to consider
-            seasonal_patterns: Whether to consider seasonal patterns
-            use_ml_model: Whether to use machine learning model for prediction
-            prediction_weight: Weight of prediction vs current conditions
-        """
-        super().__init__(
-            min_cycle=min_cycle,
-            max_cycle=max_cycle,
-            lost_time_per_phase=lost_time_per_phase,
-            target_v_c_ratio=target_v_c_ratio,
-            update_interval=update_interval,
-            critical_intersection=critical_intersection
-        )
-        self.prediction_horizon = prediction_horizon
-        self.historical_periods = historical_periods
-        self.seasonal_patterns = seasonal_patterns
-        self.use_ml_model = use_ml_model
-        self.prediction_weight = prediction_weight
-        
-        # Historical data storage
-        self.historical_data = []  # List of (timestamp, day_of_week, time_of_day, movement_data) tuples
-        self.predicted_movements = {}  # Cache for predicted movement data
-        self.movements = {}  # Cache for current movements
-        
-        # Prediction model parameters
-        self.trained_model = False
-        self.model_features = []
-        self.model_weights = {}
-        
-        logger.info("Predictive signal optimizer initialized")
-    
-    def optimize(
-        self,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        current_timings: Dict[str, float],
-        coordination_data: Optional[Dict[str, Any]] = None
-    ) -> OptimizationResult:
-        """
-        Optimize signal timings using predictive approach.
-        
-        Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            current_timings: Dictionary of phase ID -> current duration
-            coordination_data: Optional data for coordination with adjacent intersections
-        
-        Returns:
-            OptimizationResult with optimized timings
-        """
-        # Cache movements for use in internal methods
-        self.movements = movements
-        
-        # Check if update is needed
-        current_time = time.time()
-        if current_time - self.last_update_time < self.update_interval and self.current_result:
-            logger.debug("Skipping optimization, using cached result")
-            return self.current_result
-        
-        # Store current data for future predictions
-        self._store_historical_data(movements)
-        
-        # If we have enough data, train prediction model
-        if len(self.historical_data) > 24 * self.historical_periods and not self.trained_model:
-            self._train_prediction_model()
-        
-        # Predict future traffic conditions
-        predicted_movements = self._predict_future_movements(movements)
-        
-        # Blend current and predicted movements
-        blended_movements = self._blend_movements(movements, predicted_movements)
-        
-        # Find critical movements
-        critical_movements = self._find_critical_movements(blended_movements, phases)
-        
-        # Calculate optimal cycle length
-        cycle_length = self._calculate_webster_cycle(critical_movements, phases)
-        
-        # Adjust to min/max bounds
-        cycle_length = max(self.min_cycle, min(self.max_cycle, cycle_length))
-        
-        # Allocate green time
-        phase_durations = self._allocate_green_time(cycle_length, blended_movements, phases, critical_movements)
-        
-        # Optimize phase sequence
-        phase_sequence = self._optimize_phase_sequence(phases, blended_movements)
-        
-        # Calculate performance index
-        performance_index = self._calculate_performance_index(cycle_length, phase_durations, blended_movements, phases)
-        
-        # Calculate delay reduction
-        delay_reduction = self._calculate_delay_reduction(cycle_length, phase_durations, 
-                                                        current_timings, blended_movements, phases)
-        
-        # Process coordination if provided
-        offset = 0.0
-        if coordination_data and coordination_data.get('enabled', False):
-            offset = self._calculate_coordination_offset(cycle_length, phase_durations, 
-                                                         coordination_data, blended_movements, phases)
-        
-        # Create optimization result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            offset=offset,
-            optimization_method="predictive",
-            performance_index=performance_index,
-            delay_reduction=delay_reduction
-        )
-        
-        # Update internal state
-        self.last_update_time = current_time
-        self.current_result = result
-        self.historical_results.append(result)
-        
-        # Keep history limited
-        if len(self.historical_results) > 100:
-            self.historical_results = self.historical_results[-100:]
-        
-        logger.info(f"Predictive optimization: cycle={cycle_length:.1f}s, PI={performance_index:.2f}")
-        return result
-    
-    def _store_historical_data(self, movements: Dict[str, MovementData]):
-        """
-        Store current traffic data for future predictions.
-        
-        Args:
-            movements: Dictionary of movement ID -> MovementData
-        """
-        # Get current time information
-        current_time = time.time()
-        now = datetime.datetime.now()
-        day_of_week = now.weekday()  # 0=Monday, 6=Sunday
-        time_of_day = now.strftime("%H:%M")
-        
-        # Store movement data
-        movement_data = {}
-        for movement_id, movement in movements.items():
-            # Store relevant metrics
-            movement_data[movement_id] = {
-                'flow_rate': movement.demand.flow_rate,
-                'queue_length': movement.demand.queue_length,
-                'saturation_rate': movement.demand.saturation_rate,
-                'arrival_rate': movement.demand.arrival_rate,
-                'density': movement.demand.density
-            }
-        
-        # Add to historical data
-        self.historical_data.append((current_time, day_of_week, time_of_day, movement_data))
-        
-        # Keep history limited but sufficient for predictions
-        max_history = 24 * 7 * self.historical_periods  # hourly data for N weeks
-        if len(self.historical_data) > max_history:
-            self.historical_data = self.historical_data[-max_history:]
-    
-    def _train_prediction_model(self):
-        """Train prediction model using historical data."""
-        logger.info("Training prediction model with historical data")
-        
-        if self.use_ml_model:
-            self._train_ml_model()
-        else:
-            self._train_simple_model()
-        
-        self.trained_model = True
-    
-    def _train_simple_model(self):
-        """Train a simple time-series model for predictions."""
-        # For each movement, build a model of flow rate by time of day and day of week
-        self.model_weights = {}
-        
-        # Extract all movement IDs from historical data
-        all_movement_ids = set()
-        for _, _, _, movement_data in self.historical_data:
-            all_movement_ids.update(movement_data.keys())
-        
-        # For each movement, calculate average flow by time and day
-        for movement_id in all_movement_ids:
-            # Group by day and time
-            day_time_flows = {}
-            
-            for _, day_of_week, time_of_day, movement_data in self.historical_data:
-                if movement_id in movement_data:
-                    day_time_key = (day_of_week, self._round_time(time_of_day))
-                    
-                    if day_time_key not in day_time_flows:
-                        day_time_flows[day_time_key] = []
-                    
-                    day_time_flows[day_time_key].append(movement_data[movement_id]['flow_rate'])
-            
-            # Calculate averages
-            flow_averages = {}
-            for day_time_key, flows in day_time_flows.items():
-                flow_averages[day_time_key] = sum(flows) / len(flows)
-            
-            self.model_weights[movement_id] = flow_averages
-    
-    def _train_ml_model(self):
-        """Train a machine learning model for predictions."""
-        # This would normally use a proper ML model
-        # For this implementation, we'll use a simplified approach
-        
-        # Create feature list
-        self.model_features = ['hour', 'minute', 'day_of_week', 'is_weekend']
-        
-        # For each movement, build a regression model
-        self.model_weights = {}
-        
-        # Extract all movement IDs from historical data
-        all_movement_ids = set()
-        for _, _, _, movement_data in self.historical_data:
-            all_movement_ids.update(movement_data.keys())
-        
-        # For each movement, train a simple model
-        for movement_id in all_movement_ids:
-            # Prepare training data
-            X = []  # Features
-            y = []  # Target (flow rate)
-            
-            for _, day_of_week, time_of_day, movement_data in self.historical_data:
-                if movement_id in movement_data:
-                    # Extract features
-                    hour, minute = map(int, time_of_day.split(':'))
-                    is_weekend = 1 if day_of_week >= 5 else 0
-                    
-                    X.append([hour, minute, day_of_week, is_weekend])
-                    y.append(movement_data[movement_id]['flow_rate'])
-            
-            # Fit linear regression model
-            weights = self._fit_linear_regression(X, y)
-            self.model_weights[movement_id] = weights
-    
-    def _fit_linear_regression(self, X: List[List[float]], y: List[float]) -> Dict[str, float]:
-        """
-        Fit a simple linear regression model.
-        
-        Args:
-            X: Feature matrix
-            y: Target values
-        
-        Returns:
-            Dictionary of feature weights
-        """
-        # This is a simplified implementation of linear regression
-        # In a real system, a proper ML library would be used
-        
-        # Convert to numpy arrays
-        X_array = np.array(X)
-        y_array = np.array(y)
-        
-        # Add constant term
-        X_with_const = np.column_stack([np.ones(X_array.shape[0]), X_array])
-        
-        # Solve for weights using normal equation
-        try:
-            weights = np.linalg.inv(X_with_const.T.dot(X_with_const)).dot(X_with_const.T).dot(y_array)
-            
-            # Convert to dictionary
-            weight_dict = {'intercept': weights[0]}
-            for i, feature in enumerate(self.model_features):
-                weight_dict[feature] = weights[i + 1]
-            
-            return weight_dict
-            
-        except np.linalg.LinAlgError:
-            logger.warning("Linear algebra error in regression, using fallback")
-            return {'intercept': np.mean(y_array)}
-    
-    def _predict_future_movements(self, current_movements: Dict[str, MovementData]) -> Dict[str, MovementData]:
-        """
-        Predict future traffic conditions.
-        
-        Args:
-            current_movements: Dictionary of movement ID -> MovementData
-        
-        Returns:
-            Dictionary of movement ID -> predicted MovementData
-        """
-        # Get current time information
-        now = datetime.datetime.now()
-        
-        # Predict for next time step (usual prediction horizon = 5 minutes)
-        future_time = now + datetime.timedelta(minutes=5 * self.prediction_horizon)
-        
-        future_day_of_week = future_time.weekday()
-        future_time_of_day = future_time.strftime("%H:%M")
-        
-        # Make predictions for each movement
-        predicted_movements = {}
-        
-        for movement_id, current_movement in current_movements.items():
-            if not self.trained_model:
-                # If model not trained, use current values
-                predicted_movements[movement_id] = current_movement
-                continue
-            
-            # Predict flow rate
-            predicted_flow = self._predict_flow_rate(movement_id, future_day_of_week, future_time_of_day)
-            
-            # Create predicted movement data
-            # Copy the current movement data but update the demand
-            predicted_demand = TrafficDemand(
-                count=int(predicted_flow / 3600 * 300),  # Convert hourly flow to 5-minute count
-                queue_length=current_movement.demand.queue_length,
-                flow_rate=predicted_flow,
-                saturation_rate=current_movement.demand.saturation_rate,
-                heavy_vehicle_percentage=current_movement.demand.heavy_vehicle_percentage,
-                arrival_rate=predicted_flow / 3600,  # Convert to per-second
-                peak_hour_factor=current_movement.demand.peak_hour_factor,
-                density=current_movement.demand.density,
-                platoon_ratio=current_movement.demand.platoon_ratio
-            )
-            
-            # Create new movement with predicted demand
-            predicted_movements[movement_id] = MovementData(
-                id=current_movement.id,
-                signals=current_movement.signals,
-                demand=predicted_demand,
-                capacity=current_movement.capacity,
-                saturation_flow=current_movement.saturation_flow,
-                min_green=current_movement.min_green,
-                max_green=current_movement.max_green,
-                yellow=current_movement.yellow,
-                red_clearance=current_movement.red_clearance,
-                startup_lost_time=current_movement.startup_lost_time,
-                lane_group_id=current_movement.lane_group_id
-            )
-        
-        # Cache predicted movements
-        self.predicted_movements = predicted_movements
-        
-        return predicted_movements
-    
-    def _predict_flow_rate(self, movement_id: str, day_of_week: int, time_of_day: str) -> float:
-        """
-        Predict flow rate for a specific movement and time.
-        
-        Args:
-            movement_id: Movement identifier
-            day_of_week: Day of week (0=Monday)
-            time_of_day: Time of day (HH:MM format)
-        
-        Returns:
-            Predicted flow rate
-        """
-        if movement_id not in self.model_weights:
-            # No model for this movement, use average flow from historical data
-            flows = [m[movement_id]['flow_rate'] for _, _, _, m in self.historical_data 
-                    if movement_id in m]
-            return sum(flows) / len(flows) if flows else 0.0
-        
-        if self.use_ml_model:
-            # Use ML model for prediction
-            # Extract features
-            hour, minute = map(int, time_of_day.split(':'))
-            is_weekend = 1 if day_of_week >= 5 else 0
-            
-            # Get model weights
-            weights = self.model_weights[movement_id]
-            
-            # Make prediction
-            prediction = weights['intercept']
-            prediction += weights.get('hour', 0) * hour
-            prediction += weights.get('minute', 0) * minute
-            prediction += weights.get('day_of_week', 0) * day_of_week
-            prediction += weights.get('is_weekend', 0) * is_weekend
-            
-            return max(0.0, prediction)
-        else:
-            # Use simple time-based model
-            rounded_time = self._round_time(time_of_day)
-            day_time_key = (day_of_week, rounded_time)
-            
-            # Get average flow for this day and time
-            if day_time_key in self.model_weights[movement_id]:
-                return self.model_weights[movement_id][day_time_key]
-            
-            # If no exact match, try nearby times
-            nearby_flows = []
-            
-            # Check same day, nearby times
-            hour, minute = map(int, rounded_time.split(':'))
-            for offset in [-15, 15, -30, 30, -45, 45, -60, 60]:
-                adjusted_time = datetime.datetime(2000, 1, 1, hour, minute) + datetime.timedelta(minutes=offset)
-                adjusted_key = (day_of_week, adjusted_time.strftime("%H:%M"))
-                
-                if adjusted_key in self.model_weights[movement_id]:
-                    nearby_flows.append(self.model_weights[movement_id][adjusted_key])
-            
-            # If we have nearby flows, use their average
-            if nearby_flows:
-                return sum(nearby_flows) / len(nearby_flows)
-            
-            # Otherwise, use average for this day
-            day_flows = [flow for key, flow in self.model_weights[movement_id].items() 
-                        if key[0] == day_of_week]
-            
-            if day_flows:
-                return sum(day_flows) / len(day_flows)
-            
-            # Last resort: use average of all flows
-            all_flows = list(self.model_weights[movement_id].values())
-            return sum(all_flows) / len(all_flows) if all_flows else 0.0
-    
-    def _round_time(self, time_of_day: str) -> str:
-        """
-        Round time to nearest 15 minutes.
-        
-        Args:
-            time_of_day: Time in HH:MM format
-        
-        Returns:
-            Rounded time in HH:MM format
-        """
-        hour, minute = map(int, time_of_day.split(':'))
-        
-        # Round to nearest 15 minutes
-        minute = ((minute + 7) // 15) * 15
-        
-        # Handle overflow
-        if minute >= 60:
-            minute = 0
-            hour = (hour + 1) % 24
-        
-        return f"{hour:02d}:{minute:02d}"
-    
-    def _blend_movements(
-        self,
-        current: Dict[str, MovementData],
-        predicted: Dict[str, MovementData]
-    ) -> Dict[str, MovementData]:
-        """
-        Blend current and predicted movement data.
-        
-        Args:
-            current: Dictionary of movement ID -> current MovementData
-            predicted: Dictionary of movement ID -> predicted MovementData
-        
-        Returns:
-            Dictionary of movement ID -> blended MovementData
-        """
-        blended_movements = {}
-        
-        for movement_id, current_movement in current.items():
-            if movement_id not in predicted:
-                blended_movements[movement_id] = current_movement
-                continue
-            
-            predicted_movement = predicted[movement_id]
-            
-            # Blend flow rates and other demand metrics
-            blended_flow = (
-                (1 - self.prediction_weight) * current_movement.demand.flow_rate +
-                self.prediction_weight * predicted_movement.demand.flow_rate
-            )
-            
-            blended_queue = (
-                (1 - self.prediction_weight) * current_movement.demand.queue_length +
-                self.prediction_weight * predicted_movement.demand.queue_length
-            )
-            
-            # Create blended demand
-            blended_demand = TrafficDemand(
-                count=int(blended_flow / 3600 * 300),  # Convert hourly flow to 5-minute count
-                queue_length=blended_queue,
-                flow_rate=blended_flow,
-                saturation_rate=current_movement.demand.saturation_rate,
-                heavy_vehicle_percentage=current_movement.demand.heavy_vehicle_percentage,
-                arrival_rate=blended_flow / 3600,  # Convert to per-second
-                peak_hour_factor=current_movement.demand.peak_hour_factor,
-                density=max(current_movement.demand.density, predicted_movement.demand.density),
-                platoon_ratio=current_movement.demand.platoon_ratio
-            )
-            
-            # Create blended movement
-            blended_movements[movement_id] = MovementData(
-                id=current_movement.id,
-                signals=current_movement.signals,
-                demand=blended_demand,
-                capacity=current_movement.capacity,
-                saturation_flow=current_movement.saturation_flow,
-                min_green=current_movement.min_green,
-                max_green=current_movement.max_green,
-                yellow=current_movement.yellow,
-                red_clearance=current_movement.red_clearance,
-                startup_lost_time=current_movement.startup_lost_time,
-                lane_group_id=current_movement.lane_group_id
-            )
-        
-        return blended_movements
-    
-    def _optimize_phase_sequence(
-        self,
-        phases: Dict[str, PhaseData],
-        movements: Dict[str, MovementData]
-    ) -> List[str]:
-        """
-        Optimize phase sequence based on predicted demand.
-        
-        Args:
-            phases: Dictionary of phase ID -> PhaseData
-            movements: Dictionary of movement ID -> MovementData
-        
-        Returns:
-            Optimized list of phase IDs
-        """
-        # Default sequence
-        default_sequence = list(phases.keys())
-        
-        # In predictive control, we might want to adapt the sequence
-        # based on predicted demand patterns
-        
-        # For simplicity, just use the default sequence
-        # A real implementation would use a more sophisticated algorithm
-        # considering predicted arrival patterns and coordination
-        
-        return default_sequence
-    
-    def _calculate_coordination_offset(
-        self,
-        cycle_length: float,
-        phase_durations: Dict[str, float],
-        coordination_data: Dict[str, Any],
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> float:
-        """
-        Calculate signal offset for coordination using prediction.
-        
-        Args:
-            cycle_length: Optimized cycle length in seconds
-            phase_durations: Dictionary of phase ID -> optimized duration
-            coordination_data: Coordination data
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Offset value in seconds
-        """
-        # Get coordination parameters
-        travel_time = coordination_data.get('travel_time', 0.0)
-        reference_offset = coordination_data.get('reference_offset', 0.0)
-        direction = coordination_data.get('direction', 'two_way')
-        
-        # Identify coordinated phase
-        coordinated_phase = next((phase_id for phase_id, phase in phases.items() 
-                                if phase.is_coordinated), None)
-        
-        if not coordinated_phase:
-            return 0.0
-        
-        # Base offset calculation (similar to fixed-time)
-        if direction == 'one_way':
-            # One-way coordination: offset = travel time
-            base_offset = travel_time % cycle_length
-        else:
-            # Two-way coordination: offset = half cycle
-            base_offset = (cycle_length / 2) % cycle_length
-        
-        # Adjust for reference offset
-        base_offset = (base_offset + reference_offset) % cycle_length
-        
-        # Predictive enhancement: adjust based on predicted platoon arrival
-        platoon_adjustment = 0.0
-        
-        # Get platoon arrival time prediction if available
-        if coordination_data.get('platoon_info'):
-            platoon_data = coordination_data['platoon_info']
-            predicted_arrival = platoon_data.get('predicted_arrival', 0.0)
-            
-            if predicted_arrival > 0:
-                # Calculate when the coordinated phase will be green
-                phase_start_time = 0.0
-                for phase_id in self.current_result.phase_sequence:
-                    if phase_id == coordinated_phase:
-                        break
-                    phase_start_time += phase_durations.get(phase_id, 0.0)
-                
-                # Adjust offset to align green window with predicted platoon arrival
-                platoon_adjustment = (predicted_arrival - phase_start_time) % cycle_length
-        
-        # Calculate final offset
-        offset = (base_offset + platoon_adjustment) % cycle_length
-        
-        return offset
-    
-    def evaluate_predictions(self) -> Dict[str, Any]:
-        """
-        Evaluate prediction accuracy.
-        
-        Returns:
-            Dictionary with prediction evaluation
-        """
-        if not self.predicted_movements or not self.trained_model:
-            return {'status': 'No prediction data available'}
-        
-        # For each movement, compare last prediction with actual value
-        accuracy_metrics = {}
-        total_error = 0.0
-        total_movements = 0
-        
-        for movement_id, current_movement in self.movements.items():
-            if movement_id not in self.predicted_movements:
-                continue
-            
-            predicted_movement = self.predicted_movements[movement_id]
-            
-            # Calculate error
-            current_flow = current_movement.demand.flow_rate
-            predicted_flow = predicted_movement.demand.flow_rate
-            
-            if current_flow > 0:
-                relative_error = abs(predicted_flow - current_flow) / current_flow
-                accuracy = max(0.0, 1.0 - relative_error)
-            else:
-                accuracy = 1.0 if predicted_flow == 0.0 else 0.0
-            
-            accuracy_metrics[movement_id] = {
-                'actual_flow': current_flow,
-                'predicted_flow': predicted_flow,
-                'accuracy': accuracy
-            }
-            
-            total_error += abs(predicted_flow - current_flow)
-            total_movements += 1
-        
-        # Calculate overall metrics
-        overall_rmse = math.sqrt(total_error**2 / max(1, total_movements))
-        overall_accuracy = sum(m['accuracy'] for m in accuracy_metrics.values()) / max(1, len(accuracy_metrics))
-        
-        return {
-            'status': 'OK',
-            'overall_accuracy': overall_accuracy,
-            'overall_rmse': overall_rmse,
-            'movement_metrics': accuracy_metrics,
-            'model_type': 'machine_learning' if self.use_ml_model else 'time_series',
-            'historical_data_points': len(self.historical_data)
-        }
-
-
-class CoordinationOptimizer(SignalOptimizer):
-    """
-    Signal optimizer that focuses on coordinating multiple intersections.
-    """
-    
-    def __init__(
-        self,
-        min_cycle: float = 60.0,
-        max_cycle: float = 180.0,
-        lost_time_per_phase: float = 4.0,
-        target_v_c_ratio: float = 0.9,
-        update_interval: float = 900.0,  # 15 minutes between updates
-        critical_intersection: bool = True,
-        network_cycle_length: Optional[float] = None,
-        coordination_speed: float = 40.0,  # km/h
-        bandwidth_efficiency: float = 0.4,
-        arterial_priority: float = 0.7,
-        coordination_type: str = 'two_way'
-    ):
-        """
-        Initialize coordination optimizer.
-        
-        Args:
-            min_cycle: Minimum cycle length in seconds
-            max_cycle: Maximum cycle length in seconds
-            lost_time_per_phase: Lost time per phase in seconds
-            target_v_c_ratio: Target volume-to-capacity ratio
-            update_interval: Time between optimization updates in seconds
-            critical_intersection: Whether this is a critical intersection
-            network_cycle_length: Network-wide common cycle length or None for local optimization
-            coordination_speed: Coordination speed in km/h
-            bandwidth_efficiency: Target bandwidth efficiency (0-1)
-            arterial_priority: Priority weight for arterial direction (0-1)
-            coordination_type: Type of coordination ('one_way' or 'two_way')
-        """
-        super().__init__(
-            min_cycle=min_cycle,
-            max_cycle=max_cycle,
-            lost_time_per_phase=lost_time_per_phase,
-            target_v_c_ratio=target_v_c_ratio,
-            update_interval=update_interval,
-            critical_intersection=critical_intersection
-        )
-        self.network_cycle_length = network_cycle_length
-        self.coordination_speed = coordination_speed
-        self.bandwidth_efficiency = bandwidth_efficiency
-        self.arterial_priority = arterial_priority
-        self.coordination_type = coordination_type
-        
-        # Network information
-        self.upstream_intersections = []
-        self.downstream_intersections = []
-        self.distance_to_upstream = {}
-        self.distance_to_downstream = {}
-        
-        # Coordination parameters
-        self.coordinated_phases = set()
-        self.fixed_offsets = {}
-        self.movements = {}  # Cache for movements
-        
-        logger.info("Coordination optimizer initialized")
-    
-    def set_network_information(
-        self,
-        upstream: List[str],
-        downstream: List[str],
-        distances_upstream: Dict[str, float],
-        distances_downstream: Dict[str, float]
-    ):
-        """
-        Set network information for coordination.
-        
-        Args:
-            upstream: List of upstream intersection IDs
-            downstream: List of downstream intersection IDs
-            distances_upstream: Dictionary of upstream ID -> distance (meters)
-            distances_downstream: Dictionary of downstream ID -> distance (meters)
-        """
-        self.upstream_intersections = upstream
-        self.downstream_intersections = downstream
-        self.distance_to_upstream = distances_upstream
-        self.distance_to_downstream = distances_downstream
-        
-        logger.info(f"Network information set: {len(upstream)} upstream, {len(downstream)} downstream intersections")
-    
-    def set_coordinated_phases(self, phase_ids: List[str], fixed_offsets: Optional[Dict[str, float]] = None):
-        """
-        Set phases that should be coordinated.
-        
-        Args:
-            phase_ids: List of phase IDs to coordinate
-            fixed_offsets: Optional dictionary of phase ID -> fixed offset
-        """
-        self.coordinated_phases = set(phase_ids)
-        self.fixed_offsets = fixed_offsets or {}
-        
-        logger.info(f"Coordinated phases set: {', '.join(phase_ids)}")
-    
-    def optimize(
-        self,
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData],
-        current_timings: Dict[str, float],
-        coordination_data: Optional[Dict[str, Any]] = None
-    ) -> OptimizationResult:
-        """
-        Optimize signal timings for coordination.
-        
-        Args:
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-            current_timings: Dictionary of phase ID -> current duration
-            coordination_data: Optional data for coordination with adjacent intersections
-        
-        Returns:
-            OptimizationResult with optimized timings
-        """
-        # Cache movements for use in internal methods
-        self.movements = movements
-        
-        # Check if update is needed
-        current_time = time.time()
-        if current_time - self.last_update_time < self.update_interval and self.current_result:
-            logger.debug("Skipping optimization, using cached result")
-            return self.current_result
-        
-        # Determine cycle length
-        if self.network_cycle_length:
-            # Use network-wide cycle length if provided
-            cycle_length = self.network_cycle_length
-        else:
-            # Calculate optimal cycle length locally
-            critical_movements = self._find_critical_movements(movements, phases)
-            cycle_length = self._calculate_webster_cycle(critical_movements, phases)
-            
-            # Adjust to min/max bounds
-            cycle_length = max(self.min_cycle, min(self.max_cycle, cycle_length))
-        
-        # Allocate green time to phases
-        critical_movements = self._find_critical_movements(movements, phases)
-        phase_durations = self._allocate_green_time(cycle_length, movements, phases, critical_movements)
-        
-        # Optimize phase sequence for coordination
-        phase_sequence = self._optimize_for_coordination(phases)
-        
-        # Calculate timing offsets for coordination
-        offset = self._calculate_coordination_offset(coordination_data)
-        
-        # Calculate performance index
-        performance_index = self._calculate_performance_index(cycle_length, phase_durations, movements, phases)
-        
-        # Calculate delay reduction
-        delay_reduction = self._calculate_delay_reduction(cycle_length, phase_durations, 
-                                                        current_timings, movements, phases)
-        
-        # Create optimization result
-        result = OptimizationResult(
-            cycle_length=cycle_length,
-            phase_durations=phase_durations,
-            phase_sequence=phase_sequence,
-            offset=offset,
-            optimization_method="coordination",
-            performance_index=performance_index,
-            delay_reduction=delay_reduction
-        )
-        
-        # Update internal state
-        self.last_update_time = current_time
-        self.current_result = result
-        self.historical_results.append(result)
-        
-        # Keep history limited
-        if len(self.historical_results) > 100:
-            self.historical_results = self.historical_results[-100:]
-        
-        logger.info(f"Coordination optimization: cycle={cycle_length:.1f}s, offset={offset:.1f}s")
-        return result
-    
-    def _optimize_for_coordination(self, phases: Dict[str, PhaseData]) -> List[str]:
-        """
-        Optimize phase sequence for signal coordination.
-        
-        Args:
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Optimized phase sequence
-        """
-        # For coordination, we typically want coordinated phases to appear
-        # at a specific point in the sequence to facilitate progression
-        
-        # First, identify coordinated phases
-        coord_phases = [phase_id for phase_id in phases if phase_id in self.coordinated_phases]
-        non_coord_phases = [phase_id for phase_id in phases if phase_id not in self.coordinated_phases]
-        
-        # For two-way coordination, put coordinated phases at the beginning and end
-        if self.coordination_type == 'two_way' and len(coord_phases) >= 2:
-            # Split coordinated phases
-            first_coord = coord_phases[0]
-            last_coord = coord_phases[-1]
-            middle_coord = coord_phases[1:-1] if len(coord_phases) > 2 else []
-            
-            # Build sequence
-            sequence = [first_coord] + non_coord_phases + middle_coord + [last_coord]
-            
-        # For one-way coordination, put all coordinated phases together
-        else:
-            sequence = coord_phases + non_coord_phases
-        
-        return sequence
-    
-    def _calculate_coordination_offset(self, coordination_data: Optional[Dict[str, Any]] = None) -> float:
-        """
-        Calculate offset for signal coordination.
-        
-        Args:
-            coordination_data: Optional coordination data
-        
-        Returns:
-            Offset in seconds
-        """
-        if not coordination_data:
-            return 0.0
-        
-        # Get cycle length
-        cycle_length = coordination_data.get('cycle_length', self.network_cycle_length or 120.0)
-        
-        # If we have fixed offsets for coordinated phases, use those
-        if self.coordinated_phases and self.fixed_offsets:
-            first_coord_phase = next(iter(self.coordinated_phases))
-            if first_coord_phase in self.fixed_offsets:
-                return self.fixed_offsets[first_coord_phase]
-        
-        # Otherwise, calculate based on distance and speed
-        travel_time = 0.0
-        
-        # Use reference intersection information
-        reference_id = coordination_data.get('reference_intersection')
-        reference_offset = coordination_data.get('reference_offset', 0.0)
-        
-        if reference_id:
-            # Calculate travel time based on distance and speed
-            if reference_id in self.distance_to_upstream:
-                distance = self.distance_to_upstream[reference_id]  # meters
-                speed = self.coordination_speed * 1000 / 3600  # Convert km/h to m/s
-                travel_time = distance / speed  # seconds
-            elif reference_id in self.distance_to_downstream:
-                distance = self.distance_to_downstream[reference_id]  # meters
-                speed = self.coordination_speed * 1000 / 3600  # Convert km/h to m/s
-                travel_time = distance / speed  # seconds
-        
-        # For two-way coordination, we typically use half-cycle offset
-        if self.coordination_type == 'two_way':
-            offset = (cycle_length / 2) % cycle_length
-        else:
-            # For one-way, offset based on travel time
-            offset = travel_time % cycle_length
-        
-        # Adjust by reference offset
-        offset = (offset + reference_offset) % cycle_length
-        
-        return offset
-    
-    def _calculate_delay_reduction(
-        self,
-        cycle_length: float,
-        phase_durations: Dict[str, float],
-        current_timings: Dict[str, float],
-        movements: Dict[str, MovementData],
-        phases: Dict[str, PhaseData]
-    ) -> float:
-        """
-        Calculate delay reduction with coordination.
-        
-        Args:
-            cycle_length: Optimized cycle length in seconds
-            phase_durations: Dictionary of phase ID -> optimized duration
-            current_timings: Dictionary of phase ID -> current duration
-            movements: Dictionary of movement ID -> MovementData
-            phases: Dictionary of phase ID -> PhaseData
-        
-        Returns:
-            Delay reduction percentage (0-100)
-        """
-        # For coordination, we need to consider not just individual intersection delay
-        # but also the progression quality through the corridor
-        
-        # First, calculate standard delay reduction
-        current_cycle = sum(current_timings.values())
-        
-        # Calculate delay with current timings
-        current_pi = self._calculate_performance_index(current_cycle, current_timings, movements, phases)
-        
-        # Calculate delay with optimized timings
-        optimized_pi = self._calculate_performance_index(cycle_length, phase_durations, movements, phases)
-        
-        # Calculate reduction percentage
-        if current_pi > 0:
-            base_reduction = max(0, (current_pi - optimized_pi) / current_pi * 100)
-        else:
-            base_reduction = 0.0
-        
-        # Add coordination benefit (simplified calculation)
-        # In reality, this would involve a more sophisticated progression quality measure
-        coordination_benefit = 0.0
-        
-        if self.coordinated_phases:
-            # Calculate green time for coordinated phases
-            coord_green = sum(
-                phase_durations.get(phase_id, 0) * 0.8  # Assuming 80% of phase duration is effective green
-                for phase_id in self.coordinated_phases
-            )
-            
-            # Calculate bandwidth efficiency (simplified)
-            bandwidth = coord_green / cycle_length
-            
-            # Estimate coordination benefit based on bandwidth
-            if bandwidth > 0:
-                coordination_benefit = min(20.0, bandwidth * 40.0)  # Max 20% additional benefit
-        
-        # Combine reductions
-        total_reduction = min(100.0, base_reduction + coordination_benefit)
-        
-        return total_reduction
-    
-    def estimate_progression_quality(self, coordination_data: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        """
-        Estimate progression quality through the coordinated corridor.
-        
-        Args:
-            coordination_data: Optional coordination data
-        
-        Returns:
-            Dictionary with progression quality metrics
-        """
-        if not self.current_result or not coordination_data:
-            return {'status': 'No coordination data available'}
-        
-        # Get current optimization result
-        cycle_length = self.current_result.cycle_length
-        offset = self.current_result.offset
-        
-        # Calculate progression metrics
-        cycle_match = 1.0
-        if self.network_cycle_length and abs(cycle_length - self.network_cycle_length) > 1.0:
-            cycle_match = self.network_cycle_length / cycle_length if cycle_length > self.network_cycle_length else cycle_length / self.network_cycle_length
-        
-        # Calculate bandwidth (simplified)
-        bandwidth = 0.0
-        
-        if self.coordinated_phases:
-            # Get green time for coordinated phases
-            coord_green = sum(
-                self.current_result.phase_durations.get(phase_id, 0) * 0.8  # Assuming 80% of phase is effective green
-                for phase_id in self.coordinated_phases
-            )
-            
-            bandwidth = coord_green / cycle_length
-        
-        # Calculate progression quality metrics
-        return {
-            'status': 'OK',
+        # Initialize results
+        results = {
             'cycle_length': cycle_length,
-            'network_cycle': self.network_cycle_length or cycle_length,
-            'cycle_match': cycle_match,
-            'offset': offset,
-            'bandwidth': bandwidth,
-            'bandwidth_efficiency': bandwidth / max(0.01, self.bandwidth_efficiency),
-            'progression_speed': self.coordination_speed,
-            'coordination_type': self.coordination_type,
-            'coordinated_phases': list(self.coordinated_phases),
-            'upstream_intersections': self.upstream_intersections,
-            'downstream_intersections': self.downstream_intersections
+            'groups': {}
         }
+        
+        # Optimize each group
+        for gid, intersections in groups_to_optimize:
+            group_results = self._optimize_group(gid, intersections, cycle_length)
+            results['groups'][gid] = group_results
+        
+        logger.info(f"Optimized coordination for {len(results['groups'])} groups")
+        return results
+    
+    def _optimize_group(self, group_id: str, intersection_ids: Set[str], cycle_length: float) -> Dict[str, Any]:
+        """
+        Optimize coordination for a group of intersections.
+        
+        Args:
+            group_id: Group identifier
+            intersection_ids: Set of intersection IDs in the group
+            cycle_length: Common cycle length
+        
+        Returns:
+            Dictionary with group optimization results
+        """
+        # Find critical path within the group
+        critical_path = self._find_critical_path(intersection_ids)
+        
+        # Calculate offsets along the critical path
+        path_offsets = self._calculate_path_offsets(critical_path, cycle_length)
+        
+        # Apply offsets to controllers
+        for intersection_id, offset in path_offsets.items():
+            if intersection_id in self.intersections:
+                intersection = self.intersections[intersection_id]
+                if intersection.controller:
+                    # Set active plan with network cycle and calculated offset
+                    current_active_plan = intersection.controller.active_plan_id
+                    
+                    # Create coordination data
+                    coordination_data = {
+                        'enabled': True,
+                        'cycle_length': cycle_length,
+                        'offset': offset,
+                        'group_id': group_id
+                    }
+                    
+                    # Update controller with coordination data
+                    if intersection.controller.running:
+                        # If running, update with current state
+                        if current_active_plan in intersection.controller.plans:
+                            current_plan = intersection.controller.plans[current_active_plan]
+                            
+                            # Update plan parameters
+                            current_plan.cycle_length = cycle_length
+                            current_plan.offset = offset
+                            current_plan.coordination_mode = True
+        
+        # Calculate bandwidth
+        bandwidth = self._calculate_bandwidth(critical_path, path_offsets, cycle_length)
+        
+        # Create result
+        result = {
+            'critical_path': critical_path,
+            'offsets': path_offsets,
+            'bandwidth': bandwidth,
+            'cycle_length': cycle_length
+        }
+        
+        return result
+    
+    def _find_critical_path(self, intersection_ids: Set[str]) -> List[str]:
+        """
+        Find the critical path through a group of intersections.
+        
+        Args:
+            intersection_ids: Set of intersection IDs
+        
+        Returns:
+            List of intersection IDs forming the critical path
+        """
+        # For simplicity, find the longest path through the group
+        # In a real system, this would consider traffic volumes
+        
+        # Build subgraph for the group
+        subgraph = defaultdict(dict)
+        
+        for i_id in intersection_ids:
+            for j_id in self.adjacency_list[i_id]:
+                if j_id in intersection_ids:
+                    subgraph[i_id][j_id] = self.adjacency_list[i_id][j_id]
+        
+        # Find longest path
+        longest_path = []
+        longest_length = 0
+        
+        for start in intersection_ids:
+            for end in intersection_ids:
+                if start != end:
+                    path = self._find_shortest_path(start, end, subgraph)
+                    
+                    if path:
+                        # Calculate total path length
+                        path_length = 0
+                        for i in range(len(path) - 1):
+                            path_length += subgraph[path[i]][path[i+1]]
+                        
+                        if path_length > longest_length:
+                            longest_length = path_length
+                            longest_path = path
+        
+        # If no path found, use any intersection
+        if not longest_path and intersection_ids:
+            longest_path = [next(iter(intersection_ids))]
+        
+        return longest_path
+    
+    def _find_shortest_path(self, start: str, end: str, graph: Dict[str, Dict[str, float]]) -> List[str]:
+        """
+        Find shortest path between two intersections using Dijkstra's algorithm.
+        
+        Args:
+            start: Starting intersection ID
+            end: Ending intersection ID
+            graph: Graph as adjacency list
+        
+        Returns:
+            List of intersection IDs forming the path
+        """
+        # Check cache
+        cache_key = (start, end)
+        if cache_key in self.path_cache:
+            return self.path_cache[cache_key]
+        
+        # Initialize
+        distances = {node: float('infinity') for node in graph}
+        distances[start] = 0
+        previous = {node: None for node in graph}
+        unvisited = list(graph.keys())
+        
+        while unvisited:
+            # Find node with minimum distance
+            current = min(unvisited, key=lambda node: distances[node])
+            
+            # Stop if we've reached the end or if current distance is infinity
+            if current == end or distances[current] == float('infinity'):
+                break
+            
+            # Remove current from unvisited
+            unvisited.remove(current)
+            
+            # Check neighbors
+            for neighbor, distance in graph[current].items():
+                if neighbor in unvisited:
+                    new_distance = distances[current] + distance
+                    if new_distance < distances[neighbor]:
+                        distances[neighbor] = new_distance
+                        previous[neighbor] = current
+        
+        # Build path
+        path = []
+        current = end
+        
+        while current:
+            path.append(current)
+            current = previous[current]
+        
+        # Reverse path
+        path.reverse()
+        
+        # Check if path is valid
+        if path[0] != start:
+            path = []
+        
+        # Cache and return
+        self.path_cache[cache_key] = path
+        return path
+    
+    def _calculate_path_offsets(self, path: List[str], cycle_length: float) -> Dict[str, float]:
+        """
+        Calculate offsets for intersections along a path.
+        
+        Args:
+            path: List of intersection IDs
+            cycle_length: Cycle length in seconds
+        
+        Returns:
+            Dictionary of intersection ID -> offset
+        """
+        offsets = {}
+        
+        # For the first intersection, offset is 0
+        if not path:
+            return offsets
+        
+        offsets[path[0]] = 0.0
+        
+        # Calculate offsets along the path
+        for i in range(len(path) - 1):
+            from_id = path[i]
+            to_id = path[i+1]
+            
+            # Get intersections
+            from_intersection = self.intersections.get(from_id)
+            to_intersection = self.intersections.get(to_id)
+            
+            if not from_intersection or not to_intersection:
+                continue
+            
+            # Calculate travel time
+            travel_time = from_intersection.get_travel_time_to(to_id)
+            
+            if travel_time < 0:
+                continue
+            
+            # Calculate offset
+            offsets[to_id] = (offsets[from_id] + travel_time) % cycle_length
+        
+        return offsets
+    
+    def _calculate_bandwidth(self, path: List[str], offsets: Dict[str, float], cycle_length: float) -> float:
+        """
+        Calculate bandwidth for a coordinated path.
+        
+        Args:
+            path: List of intersection IDs
+            offsets: Dictionary of intersection ID -> offset
+            cycle_length: Cycle length in seconds
+        
+        Returns:
+            Bandwidth as percentage of cycle length
+        """
+        if len(path) <= 1:
+            return 1.0  # Single intersection has full bandwidth
+        
+        # Get green times for each intersection
+        green_times = {}
+        
+        for i_id in path:
+            if i_id in self.intersections:
+                intersection = self.intersections[i_id]
+                if intersection.controller and intersection.controller.current_result:
+                    # Find coordinated phases
+                    coordinated_phases = set()
+                    for phase_id, phase in intersection.controller.plans.items():
+                        if hasattr(phase, 'is_coordinated') and phase.is_coordinated:
+                            coordinated_phases.add(phase_id)
+                    
+                    # Calculate total green time for coordinated phases
+                    green = 0.0
+                    for phase_id, duration in intersection.controller.current_result.phase_durations.items():
+                        if phase_id in coordinated_phases:
+                            # Assume effective green is 80% of phase duration
+                            green += duration * 0.8
+                    
+                    green_times[i_id] = green
+                else:
+                    # Default assumption
+                    green_times[i_id] = cycle_length * 0.4
+            else:
+                green_times[i_id] = cycle_length * 0.4
+        
+        # Calculate bandwidth (simplified method)
+        min_green = min(green_times.values())
+        bandwidth = min_green / cycle_length
+        
+        return bandwidth
+    
+    def create_green_wave(self, path: List[str], speed: float) -> Dict[str, Any]:
+        """
+        Create a green wave along a path of intersections.
+        
+        Args:
+            path: List of intersection IDs
+            speed: Desired progression speed in km/h
+        
+        Returns:
+            Dictionary with green wave configuration
+        """
+        # Calculate common cycle length
+        cycle_length = self.calculate_network_cycle_length()
+        
+        # Create results structure
+        results = {
+            'path': path,
+            'speed': speed,
+            'cycle_length': cycle_length,
+            'offsets': {},
+            'success': True
+        }
+        
+        # Calculate offsets for green wave
+        current_offset = 0.0
+        
+        for i in range(len(path) - 1):
+            from_id = path[i]
+            to_id = path[i+1]
+            
+            # Store current offset
+            results['offsets'][from_id] = current_offset
+            
+            # Get distance between intersections
+            distance = 0.0
+            
+            if from_id in self.adjacency_list and to_id in self.adjacency_list[from_id]:
+                distance = self.adjacency_list[from_id][to_id]
+            else:
+                # Path is not contiguous
+                results['success'] = False
+                logger.warning(f"Green wave path is not contiguous: {from_id} -> {to_id}")
+                continue
+            
+            # Calculate travel time at desired speed
+            speed_m_s = speed * 1000 / 3600  # Convert km/h to m/s
+            travel_time = distance / speed_m_s
+            
+            # Update offset for next intersection
+            current_offset = (current_offset + travel_time) % cycle_length
+        
+        # Add last intersection
+        if path:
+            results['offsets'][path[-1]] = current_offset
+        
+        # Apply offsets to controllers
+        for intersection_id, offset in results['offsets'].items():
+            if intersection_id in self.intersections:
+                intersection = self.intersections[intersection_id]
+                if intersection.controller:
+                    # Set coordination speed
+                    intersection.set_coordination_speed(speed)
+                    
+                    # Set active plan with network cycle and calculated offset
+                    current_active_plan = intersection.controller.active_plan_id
+                    
+                    # Update controller with coordination data
+                    if intersection.controller.running:
+                        # If running, update with current state
+                        if current_active_plan in intersection.controller.plans:
+                            current_plan = intersection.controller.plans[current_active_plan]
+                            
+                            # Update plan parameters
+                            current_plan.cycle_length = cycle_length
+                            current_plan.offset = offset
+                            current_plan.coordination_mode = True
+        
+        logger.info(f"Created green wave along path with {len(path)} intersections at {speed} km/h")
+        return results
+    
+    def handle_emergency_vehicle(self, vehicle_location: Tuple[float, float], route: List[str], 
+                               clear_time_sec: float = 30.0) -> Dict[str, Any]:
+        """
+        Handle emergency vehicle prioritization.
+        
+        Args:
+            vehicle_location: Current (lat, lon) location of emergency vehicle
+            route: List of intersection IDs on the route
+            clear_time_sec: Time in seconds to clear ahead of vehicle
+        
+        Returns:
+            Dictionary with prioritization results
+        """
+        # Calculate intersections to prioritize
+        prioritized = []
+        
+        # Calculate estimated arrival times
+        arrival_times = {}
+        current_time = 0.0
+        
+        # Find closest intersection to current location
+        closest_id = None
+        closest_dist = float('infinity')
+        
+        for intersection_id, intersection in self.intersections.items():
+            # Calculate distance (simple approximation)
+            lat_diff = intersection.location[0] - vehicle_location[0]
+            lon_diff = intersection.location[1] - vehicle_location[1]
+            distance = math.sqrt(lat_diff**2 + lon_diff**2) * 111000  # Rough conversion to meters
+            
+            if distance < closest_dist:
+                closest_dist = distance
+                closest_id = intersection_id
+        
+        # If we found a starting intersection and it's in the route
+        if closest_id and closest_id in route:
+            # Calculate time to arrival (assuming 80 km/h for emergency vehicle)
+            emergency_speed = 80.0  # km/h
+            emergency_speed_m_s = emergency_speed * 1000 / 3600  # m/s
+            
+            current_time = closest_dist / emergency_speed_m_s
+            
+            # Get index in route
+            start_index = route.index(closest_id)
+            
+            # Calculate arrival times for subsequent intersections
+            arrival_times[closest_id] = current_time
+            
+            for i in range(start_index, len(route) - 1):
+                from_id = route[i]
+                to_id = route[i+1]
+                
+                # Get distance
+                distance = 0.0
+                if from_id in self.adjacency_list and to_id in self.adjacency_list[from_id]:
+                    distance = self.adjacency_list[from_id][to_id]
+                
+                # Calculate travel time
+                travel_time = distance / emergency_speed_m_s
+                current_time += travel_time
+                arrival_times[to_id] = current_time
+            
+            # Prioritize intersections that need to be cleared in advance
+            for intersection_id, arrival_time in arrival_times.items():
+                if arrival_time <= clear_time_sec:
+                    # Immediate prioritization needed
+                    if intersection_id in self.intersections:
+                        direction = self._get_direction_from_route(intersection_id, route)
+                        
+                        # Set preemption
+                        self.intersections[intersection_id].set_emergency_preemption(True, direction)
+                        prioritized.append(intersection_id)
+        
+        # Create result
+        result = {
+            'prioritized_intersections': prioritized,
+            'arrival_times': arrival_times,
+            'clear_time_sec': clear_time_sec,
+            'emergency_route': route
+        }
+        
+        logger.info(f"Prioritized {len(prioritized)} intersections for emergency vehicle")
+        return result
+    
+    def _get_direction_from_route(self, intersection_id: str, route: List[str]) -> Optional[LaneDirection]:
+        """
+        Determine emergency vehicle approach direction from route.
+        
+        Args:
+            intersection_id: Intersection ID
+            route: List of intersection IDs on the route
+        
+        Returns:
+            LaneDirection or None if unknown
+        """
+        try:
+            # Find position in route
+            index = route.index(intersection_id)
+            
+            # If first in route, can't determine approach
+            if index == 0:
+                return None
+            
+            # Get previous intersection
+            prev_id = route[index - 1]
+            
+            # Get next intersection if available
+            next_id = route[index + 1] if index < len(route) - 1 else None
+            
+            # Get intersection
+            intersection = self.intersections.get(intersection_id)
+            if not intersection:
+                return None
+            
+            # Get previous intersection
+            prev_intersection = self.intersections.get(prev_id)
+            if not prev_intersection:
+                return None
+            
+            # Calculate rough approach direction
+            lat_diff = intersection.location[0] - prev_intersection.location[0]
+            lon_diff = intersection.location[1] - prev_intersection.location[1]
+            
+            # Determine direction based on larger difference
+            if abs(lat_diff) > abs(lon_diff):
+                # North-South direction
+                if lat_diff > 0:
+                    direction = LaneDirection.NORTHBOUND
+                else:
+                    direction = LaneDirection.SOUTHBOUND
+            else:
+                # East-West direction
+                if lon_diff > 0:
+                    direction = LaneDirection.EASTBOUND
+                else:
+                    direction = LaneDirection.WESTBOUND
+            
+            # Refine with next intersection if available
+            if next_id:
+                next_intersection = self.intersections.get(next_id)
+                if next_intersection:
+                    # Calculate exit direction
+                    exit_lat_diff = next_intersection.location[0] - intersection.location[0]
+                    exit_lon_diff = next_intersection.location[1] - intersection.location[1]
+                    
+                    # Check if this is a left turn
+                    if direction == LaneDirection.NORTHBOUND and exit_lon_diff < 0:
+                        direction = LaneDirection.NORTHBOUND_LEFT
+                    elif direction == LaneDirection.SOUTHBOUND and exit_lon_diff > 0:
+                        direction = LaneDirection.SOUTHBOUND_LEFT
+                    elif direction == LaneDirection.EASTBOUND and exit_lat_diff > 0:
+                        direction = LaneDirection.EASTBOUND_LEFT
+                    elif direction == LaneDirection.WESTBOUND and exit_lat_diff < 0:
+                        direction = LaneDirection.WESTBOUND_LEFT
+                    
+                    # Check if this is a right turn
+                    elif direction == LaneDirection.NORTHBOUND and exit_lon_diff > 0:
+                        direction = LaneDirection.NORTHBOUND_RIGHT
+                    elif direction == LaneDirection.SOUTHBOUND and exit_lon_diff < 0:
+                        direction = LaneDirection.SOUTHBOUND_RIGHT
+                    elif direction == LaneDirection.EASTBOUND and exit_lat_diff < 0:
+                        direction = LaneDirection.EASTBOUND_RIGHT
+                    elif direction == LaneDirection.WESTBOUND and exit_lat_diff > 0:
+                        direction = LaneDirection.WESTBOUND_RIGHT
+            
+            return direction
+            
+        except (ValueError, IndexError):
+            return None
+    
+    def clear_emergency_preemption(self, route: List[str]) -> None:
+        """
+        Clear emergency preemption for a route.
+        
+        Args:
+            route: List of intersection IDs to clear
+        """
+        for intersection_id in route:
+            if intersection_id in self.intersections:
+                self.intersections[intersection_id].set_emergency_preemption(False)
+        
+        logger.info(f"Cleared emergency preemption for {len(route)} intersections")
+    
+    def update_traffic_data(self, intersection_id: str, flow_data: Any) -> None:
+        """
+        Update traffic data for an intersection.
+        
+        Args:
+            intersection_id: Intersection ID
+            flow_data: Traffic flow data
+        """
+        if intersection_id in self.intersections:
+            # Update intersection congestion
+            self.intersections[intersection_id].update_congestion(flow_data)
+            
+            # Update controller
+            if self.intersections[intersection_id].controller:
+                self.intersections[intersection_id].controller.update(flow_data)
+    
+    def get_network_statistics(self) -> Dict[str, Any]:
+        """
+        Get statistics for the entire network.
+        
+        Returns:
+            Dictionary with network statistics
+        """
+        stats = {
+            'intersection_count': len(self.intersections),
+            'critical_intersection_count': len(self.critical_intersections),
+            'coordination_group_count': len(self.coordination_groups),
+            'network_cycle_length': self.network_cycle_length,
+            'average_congestion': 0.0,
+            'total_vehicles': 0,
+            'intersections': {}
+        }
+        
+        # Calculate aggregate statistics
+        if self.intersections:
+            congestion_sum = sum(i.congestion_level for i in self.intersections.values())
+            stats['average_congestion'] = congestion_sum / len(self.intersections)
+            
+            stats['total_vehicles'] = sum(i.total_vehicles for i in self.intersections.values())
+        
+        # Individual intersection stats
+        for intersection_id, intersection in self.intersections.items():
+            stats['intersections'][intersection_id] = {
+                'name': intersection.name,
+                'congestion_level': intersection.congestion_level,
+                'total_vehicles': intersection.total_vehicles,
+                'lane_count': len(intersection.lanes),
+                'is_critical': intersection_id in self.critical_intersections,
+                'coordinated': any(intersection_id in group for group in self.coordination_groups.values())
+            }
+        
+        return stats
+    
+    def save_to_file(self, file_path: str) -> bool:
+        """
+        Save network configuration to file.
+        
+        Args:
+            file_path: Path to save file
+        
+        Returns:
+            True if saved successfully, False otherwise
+        """
+        try:
+            # Create serializable data
+            data = {
+                'intersections': {
+                    intersection_id: intersection.to_dict()
+                    for intersection_id, intersection in self.intersections.items()
+                },
+                'critical_intersections': list(self.critical_intersections),
+                'coordination_groups': {
+                    group_id: list(intersections)
+                    for group_id, intersections in self.coordination_groups.items()
+                },
+                'network_cycle_length': self.network_cycle_length
+            }
+            
+            # Write to file
+            with open(file_path, 'w') as f:
+                json.dump(data, f, indent=2)
+            
+            logger.info(f"Network configuration saved to {file_path}")
+            return True
+            
+        except Exception as e:
+            logger.error(f"Failed to save network configuration: {str(e)}")
+            return False
+    
+    @classmethod
+    def load_from_file(cls, file_path: str, controllers: Optional[Dict[str, TrafficLightController]] = None) -> 'IntersectionNetwork':
+        """
+        Load network configuration from file.
+        
+        Args:
+            file_path: Path to load file
+            controllers: Optional dictionary of intersection ID -> TrafficLightController
+        
+        Returns:
+            IntersectionNetwork instance
+        """
+        try:
+            # Read from file
+            with open(file_path, 'r') as f:
+                data = json.load(f)
+            
+            # Create network
+            network = cls()
+            
+            # Add intersections
+            for intersection_id, intersection_data in data['intersections'].items():
+                controller = None
+                if controllers and intersection_id in controllers:
+                    controller = controllers[intersection_id]
+                
+                intersection = Intersection.from_dict(intersection_data, controller)
+                network.add_intersection(intersection)
+            
+            # Set critical intersections
+            network.critical_intersections = set(data['critical_intersections'])
+            
+            # Set coordination groups
+            for group_id, intersection_ids in data['coordination_groups'].items():
+                network.coordination_groups[group_id] = set(intersection_ids)
+            
+            # Set network cycle length
+            network.network_cycle_length = data['network_cycle_length']
+            
+            logger.info(f"Network configuration loaded from {file_path}")
+            return network
+            
+        except Exception as e:
+            logger.error(f"Failed to load network configuration: {str(e)}")
+            raise
+
+
+class IntersectionManager:
+    """
+    Manager for handling intersection control and coordination.
+    """
+    
+    def __init__(self, network: Optional[IntersectionNetwork] = None):
+        """
+        Initialize intersection manager.
+        
+        Args:
+            network: Optional existing intersection network
+        """
+        self.network = network or IntersectionNetwork()
+        self.controllers = {}  # intersection_id -> TrafficLightController
+        self.running = False
+        self.stop_event = threading.Event()
+        self.update_thread = None
+        self.update_interval = 5.0  # seconds
+        
+        # Performance metrics
+        self.last_update_time = 0.0
+        self.update_count = 0
+        
+        logger.info("Intersection manager initialized")
+    
+    def add_controller(self, intersection_id: str, controller: TrafficLightController) -> bool:
+        """
+        Add a traffic light controller for an intersection.
+        
+        Args:
+            intersection_id: Intersection ID
+            controller: TrafficLightController instance
+        
+        Returns:
+            True if added, False if intersection not found
+        """
+        if intersection_id not in self.network.intersections:
+            return False
+        
+        self.controllers[intersection_id] = controller
+        self.network.intersections[intersection_id].controller = controller
+        
+        logger.info(f"Added controller for intersection {intersection_id}")
+        return True
+    
+    def add_intersection(self, intersection: Intersection, controller: Optional[TrafficLightController] = None) -> None:
+        """
+        Add an intersection with optional controller.
+        
+        Args:
+            intersection: Intersection to add
+            controller: Optional controller for the intersection
+        """
+        # Add to network
+        self.network.add_intersection(intersection)
+        
+        # Add controller if provided
+        if controller:
+            self.controllers[intersection.id] = controller
+            intersection.controller = controller
+            
+            logger.info(f"Added intersection {intersection.id} with controller")
+        else:
+            logger.info(f"Added intersection {intersection.id} without controller")
+    
+    def remove_intersection(self, intersection_id: str) -> bool:
+        """
+        Remove an intersection and its controller.
+        
+        Args:
+            intersection_id: Intersection ID to remove
+        
+        Returns:
+            True if removed, False if not found
+        """
+        # Remove from network
+        result = self.network.remove_intersection(intersection_id)
+        
+        # Remove controller if exists
+        if intersection_id in self.controllers:
+            del self.controllers[intersection_id]
+        
+        return result
+    
+    def start(self) -> bool:
+        """
+        Start the intersection manager and all controllers.
+        
+        Returns:
+            True if started successfully
+        """
+        if self.running:
+            logger.warning("Intersection manager is already running")
+            return True
+        
+        logger.info("Starting intersection manager")
+        
+        # Reset stop event
+        self.stop_event.clear()
+        
+        # Start controllers
+        started_count = 0
+        
+        for intersection_id, controller in self.controllers.items():
+            if controller.start():
+                started_count += 1
+            else:
+                logger.warning(f"Failed to start controller for intersection {intersection_id}")
+        
+        # Start update thread
+        self.update_thread = threading.Thread(target=self._update_loop, daemon=True)
+        self.update_thread.start()
+        
+        self.running = True
+        logger.info(f"Intersection manager started with {started_count} controllers")
+        
+        return True
+    
+    def stop(self) -> None:
+        """Stop the intersection manager and all controllers."""
+        if not self.running:
+            return
+        
+        logger.info("Stopping intersection manager")
+        
+        # Signal thread to stop
+        self.stop_event.set()
+        
+        # Wait for thread to finish
+        if self.update_thread and self.update_thread.is_alive():
+            self.update_thread.join(timeout=3.0)
+        
+        # Stop controllers
+        for intersection_id, controller in self.controllers.items():
+            controller.stop()
+        
+        self.running = False
+        logger.info("Intersection manager stopped")
+    
+    def _update_loop(self) -> None:
+        """Update loop for coordination."""
+        logger.info("Update loop started")
+        
+        while not self.stop_event.is_set():
+            try:
+                current_time = time.time()
+                
+                # Update at specified interval
+                if current_time - self.last_update_time >= self.update_interval:
+                    self._perform_coordination_update()
+                    self.last_update_time = current_time
+                    self.update_count += 1
+                
+                # Sleep to avoid busy waiting
+                time.sleep(0.1)
+                
+            except Exception as e:
+                logger.error(f"Error in update loop: {str(e)}")
+                time.sleep(1.0)
+    
+    def _perform_coordination_update(self) -> None:
+        """Perform coordination update."""
+        # Calculate network cycle length
+        self.network.calculate_network_cycle_length()
+        
+        # Optimize coordination for each group
+        self.network.optimize_coordination()
+    
+    def update_traffic_data(self, intersection_id: str, flow_data: Any) -> bool:
+        """
+        Update traffic data for an intersection.
+        
+        Args:
+            intersection_id: Intersection ID
+            flow_data: Traffic flow data
+        
+        Returns:
+            True if updated, False if intersection not found
+        """
+        if intersection_id not in self.network.intersections:
+            return False
+        
+        # Update network data
+        self.network.update_traffic_data(intersection_id, flow_data)
+        
+        return True
+    
+    def create_green_wave(self, start_id: str, end_id: str, speed: float) -> Dict[str, Any]:
+        """
+        Create a green wave between two intersections.
+        
+        Args:
+            start_id: Starting intersection ID
+            end_id: Ending intersection ID
+            speed: Desired progression speed in km/h
+        
+        Returns:
+            Result dictionary
+        """
+        # Find path between intersections
+        path = []
+        
+        # Check if intersections exist
+        if start_id not in self.network.intersections or end_id not in self.network.intersections:
+            return {'success': False, 'error': 'Intersection not found'}
+        
+        # Find shortest path
+        path = self.network._find_shortest_path(start_id, end_id, self.network.adjacency_list)
+        
+        if not path:
+            return {'success': False, 'error': 'No path found between intersections'}
+        
+        # Create green wave
+        result = self.network.create_green_wave(path, speed)
+        
+        return result
+    
+    def handle_emergency_vehicle(self, vehicle_location: Tuple[float, float], 
+                               destination: Tuple[float, float]) -> Dict[str, Any]:
+        """
+        Handle emergency vehicle route and prioritization.
+        
+        Args:
+            vehicle_location: Current (lat, lon) location of emergency vehicle
+            destination: Destination (lat, lon) location
+        
+        Returns:
+            Result dictionary
+        """
+        # Find nearest intersections to start and end
+        start_id = self._find_nearest_intersection(vehicle_location)
+        end_id = self._find_nearest_intersection(destination)
+        
+        if not start_id or not end_id:
+            return {'success': False, 'error': 'Could not find nearby intersections'}
+        
+        # Find route
+        route = self.network._find_shortest_path(start_id, end_id, self.network.adjacency_list)
+        
+        if not route:
+            return {'success': False, 'error': 'No route found'}
+        
+        # Handle emergency vehicle
+        result = self.network.handle_emergency_vehicle(vehicle_location, route)
+        
+        # Add additional info
+        result['start_intersection'] = start_id
+        result['end_intersection'] = end_id
+        result['success'] = True
+        
+        return result
+    
+    def _find_nearest_intersection(self, location: Tuple[float, float]) -> Optional[str]:
+        """
+        Find the nearest intersection to a location.
+        
+        Args:
+            location: (lat, lon) location
+        
+        Returns:
+            Nearest intersection ID or None if none found
+        """
+        nearest_id = None
+        min_distance = float('infinity')
+        
+        for intersection_id, intersection in self.network.intersections.items():
+            # Calculate distance (simple approximation)
+            lat_diff = intersection.location[0] - location[0]
+            lon_diff = intersection.location[1] - location[1]
+            distance = math.sqrt(lat_diff**2 + lon_diff**2)
+            
+            if distance < min_distance:
+                min_distance = distance
+                nearest_id = intersection_id
+        
+        return nearest_id
+    
+    def get_intersection_status(self, intersection_id: str) -> Dict[str, Any]:
+        """
+        Get status of an intersection.
+        
+        Args:
+            intersection_id: Intersection ID
+        
+        Returns:
+            Status dictionary
+        """
+        if intersection_id not in self.network.intersections:
+            return {'error': 'Intersection not found'}
+        
+        intersection = self.network.intersections[intersection_id]
+        
+        # Get controller state if available
+        controller_state = {}
+        if intersection.controller:
+            controller_state = intersection.controller.get_current_state()
+        
+        # Build status
+        status = {
+            'id': intersection_id,
+            'name': intersection.name,
+            'location': intersection.location,
+            'congestion_level': intersection.congestion_level,
+            'total_vehicles': intersection.total_vehicles,
+            'lanes': {lane_id: lane.to_dict() for lane_id, lane in intersection.lanes.items()},
+            'upstream_intersections': intersection.upstream_intersections,
+            'downstream_intersections': intersection.downstream_intersections,
+            'is_critical': intersection_id in self.network.critical_intersections,
+            'coordinated': any(intersection_id in group for group in self.network.coordination_groups.values()),
+            'controller': controller_state,
+            'emergency_preemption_active': intersection.emergency_preemption_active
+        }
+        
+        return status
+    
+    def get_network_status(self) -> Dict[str, Any]:
+        """
+        Get status of the entire network.
+        
+        Returns:
+            Network status dictionary
+        """
+        # Get network statistics
+        stats = self.network.get_network_statistics()
+        
+        # Add manager info
+        status = {
+            'running': self.running,
+            'controller_count': len(self.controllers),
+            'update_count': self.update_count,
+            'update_interval': self.update_interval,
+            'last_update_time': self.last_update_time,
+            'network': stats
+        }
+        
+        return status
+    
+    def save_configuration(self, file_path: str) -> bool:
+        """
+        Save manager configuration to file.
+        
+        Args:
+            file_path: Path to save file
+        
+        Returns:
+            True if saved successfully
+        """
+        return self.network.save_to_file(file_path)
+    
+    @classmethod
+    def load_configuration(cls, file_path: str) -> 'IntersectionManager':
+        """
+        Load manager configuration from file.
+        
+        Args:
+            file_path: Path to load file
+        
+        Returns:
+            IntersectionManager instance
+        """
+        # Load network
+        network = IntersectionNetwork.load_from_file(file_path)
+        
+        # Create manager
+        manager = cls(network)
+        
+        # Transfer controllers from network to manager
+        for intersection_id, intersection in network.intersections.items():
+            if intersection.controller:
+                manager.controllers[intersection_id] = intersection.controller
+        
+        return manager
