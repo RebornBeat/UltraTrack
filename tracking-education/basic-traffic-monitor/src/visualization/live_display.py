@@ -1,6 +1,6 @@
 """
 Live display module for real-time visualization of traffic monitoring results.
-Provides configurable display modes and overlay options.
+Provides configurable display modes and overlay options, including traffic light visualization.
 """
 
 import time
@@ -26,6 +26,7 @@ class DisplayMode(Enum):
     SPEED = 'speed'                 # Show speed measurements
     FLOW = 'flow'                   # Show traffic flow
     LICENSE_PLATE = 'license_plate' # Show license plate recognition
+    TRAFFIC_LIGHTS = 'traffic_lights' # Show traffic light states
     COMPOSITE = 'composite'         # Composite of multiple views
 
 
@@ -40,6 +41,7 @@ class DisplayConfig:
     show_speed: bool = True
     show_flow: bool = True
     show_plates: bool = True
+    show_traffic_lights: bool = True
     window_name: str = "Traffic Monitoring"
     fullscreen: bool = False
     display_fps: int = 30
@@ -76,12 +78,27 @@ class FrameProcessor:
             'UNKNOWN': (128, 128, 128) # Gray
         }
         
+        # Traffic light colors
+        self.traffic_light_colors = {
+            'red': (0, 0, 255),        # Red
+            'yellow': (0, 255, 255),   # Yellow
+            'green': (0, 255, 0),      # Green
+            'flashing_red': (0, 0, 255),  # Red
+            'flashing_yellow': (0, 255, 255),  # Yellow
+            'off': (128, 128, 128)     # Gray
+        }
+        
         # Status display values
         self.fps = 0.0
         self.frame_count = 0
         self.processing_time = 0.0
         self.detection_count = 0
         self.tracking_count = 0
+        
+        # Traffic light flashing state
+        self.flash_state = False
+        self.last_flash_time = time.time()
+        self.flash_interval = 0.5  # seconds
         
         logger.info("Frame processor initialized")
     
@@ -94,7 +111,9 @@ class FrameProcessor:
         zones: Optional[Dict[str, Any]] = None,
         speeds: Optional[Dict[int, float]] = None,
         plates: Optional[List[Any]] = None,
-        flow_data: Optional[Any] = None
+        flow_data: Optional[Any] = None,
+        traffic_lights: Optional[Dict[str, Any]] = None,
+        processing_time: float = 0.0
     ) -> np.ndarray:
         """
         Process a frame for display with selected visualization mode.
@@ -108,6 +127,8 @@ class FrameProcessor:
             speeds: Optional dictionary of vehicle_id -> speed
             plates: Optional list of license plate objects
             flow_data: Optional flow visualization data
+            traffic_lights: Optional traffic light states
+            processing_time: Processing time in milliseconds
         
         Returns:
             Processed frame for display
@@ -121,6 +142,12 @@ class FrameProcessor:
         
         # Make a copy of the frame for drawing
         display = frame.copy()
+        
+        # Update flashing state for traffic lights
+        current_time = time.time()
+        if current_time - self.last_flash_time > self.flash_interval:
+            self.flash_state = not self.flash_state
+            self.last_flash_time = current_time
         
         # Apply visualizations based on mode
         if mode == DisplayMode.RAW:
@@ -151,28 +178,35 @@ class FrameProcessor:
             # Show license plate recognition
             display = self._draw_plates(display, plates)
         
+        elif mode == DisplayMode.TRAFFIC_LIGHTS and traffic_lights:
+            # Show traffic light states
+            display = self._draw_traffic_lights(display, traffic_lights)
+        
         elif mode == DisplayMode.COMPOSITE:
             # Show composite view with all available visualizations
-            if detections:
+            if detections and self.config.show_boxes:
                 display = self._draw_detections(display, detections)
             
-            if tracks:
+            if tracks and self.config.show_trails:
                 display = self._draw_tracks(display, tracks)
             
-            if zones:
+            if zones and self.config.show_zones:
                 display = self._draw_counting_zones(display, zones, tracks)
             
-            if speeds and tracks:
+            if speeds and tracks and self.config.show_speed:
                 display = self._draw_speeds(display, speeds, tracks)
             
-            if flow_data:
+            if flow_data and self.config.show_flow:
                 display = self._draw_flow(display, flow_data)
             
-            if plates:
+            if plates and self.config.show_plates:
                 display = self._draw_plates(display, plates)
+                
+            if traffic_lights and self.config.show_traffic_lights:
+                display = self._draw_traffic_lights(display, traffic_lights)
         
         # Draw status overlay
-        display = self._draw_status_overlay(display)
+        display = self._draw_status_overlay(display, processing_time)
         
         return display
     
@@ -603,12 +637,127 @@ class FrameProcessor:
         
         return frame
     
-    def _draw_status_overlay(self, frame: np.ndarray) -> np.ndarray:
+    def _draw_traffic_lights(self, frame: np.ndarray, traffic_lights: Dict[str, Any]) -> np.ndarray:
+        """
+        Draw traffic light states on the frame.
+        
+        Args:
+            frame: Input video frame
+            traffic_lights: Dictionary of intersection_id -> traffic light state
+        
+        Returns:
+            Frame with drawn traffic light states
+        """
+        if not self.config.show_traffic_lights or not traffic_lights:
+            return frame
+        
+        # Draw panel with traffic light states
+        panel_width = 300
+        panel_height = len(traffic_lights) * 120 + 40
+        panel_x = frame.shape[1] - panel_width - 10
+        panel_y = 10
+        
+        # Create semi-transparent panel
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (panel_x, panel_y), 
+                    (panel_x + panel_width, panel_y + panel_height), 
+                    (32, 32, 32), -1)
+        
+        # Add transparency
+        cv2.addWeighted(overlay, 0.7, frame, 0.3, 0, frame)
+        
+        # Draw panel title
+        cv2.putText(frame, "Traffic Light Status", 
+                  (panel_x + 10, panel_y + 30), 
+                  cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Draw each intersection
+        y_offset = panel_y + 60
+        
+        for intersection_id, state in traffic_lights.items():
+            # Draw intersection name
+            cv2.putText(frame, f"Intersection: {intersection_id}", 
+                      (panel_x + 10, y_offset), 
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
+            
+            # Draw signals
+            if 'signals' in state:
+                signal_x = panel_x + 15
+                signal_y = y_offset + 25
+                
+                for signal_id, signal_data in state['signals'].items():
+                    # Get signal state
+                    signal_state = signal_data.get('state', 'red').lower()
+                    
+                    # Get color for state
+                    color = self.traffic_light_colors.get(signal_state, (128, 128, 128))
+                    
+                    # For flashing states, handle flashing
+                    if 'flashing' in signal_state and not self.flash_state:
+                        color = (128, 128, 128)  # Gray when off in flash cycle
+                    
+                    # Draw traffic light
+                    self._draw_traffic_light_icon(frame, signal_x, signal_y, color)
+                    
+                    # Draw signal ID
+                    cv2.putText(frame, signal_id, 
+                              (signal_x + 25, signal_y + 8), 
+                              cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                    
+                    # Update position for next signal
+                    signal_x += 70
+                    if signal_x > panel_x + panel_width - 60:
+                        signal_x = panel_x + 15
+                        signal_y += 30
+            
+            # Draw active plan
+            if 'active_plan_id' in state:
+                cv2.putText(frame, f"Plan: {state['active_plan_id']}", 
+                          (panel_x + 10, y_offset + 85), 
+                          cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 255), 1)
+            
+            # Update y_offset for next intersection
+            y_offset += 120
+        
+        return frame
+    
+    def _draw_traffic_light_icon(self, frame: np.ndarray, x: int, y: int, color: Tuple[int, int, int]) -> None:
+        """
+        Draw a traffic light icon.
+        
+        Args:
+            frame: Input video frame
+            x: X position
+            y: Y position
+            color: Light color (BGR)
+        """
+        # Draw traffic light housing
+        cv2.rectangle(frame, (x, y), (x + 20, y + 50), (50, 50, 50), -1)
+        cv2.rectangle(frame, (x, y), (x + 20, y + 50), (100, 100, 100), 2)
+        
+        # Draw light (one active light in the housing)
+        light_y = 0
+        if np.array_equal(color, self.traffic_light_colors['red']):
+            light_y = y + 10
+        elif np.array_equal(color, self.traffic_light_colors['yellow']):
+            light_y = y + 25
+        elif np.array_equal(color, self.traffic_light_colors['green']):
+            light_y = y + 40
+        else:
+            # For unknown states, center the light
+            light_y = y + 25
+        
+        # Draw the active light
+        cv2.circle(frame, (x + 10, light_y), 7, color, -1)
+        cv2.circle(frame, (x + 10, light_y), 7, (255, 255, 255), 1)
+    
+    def _draw_status_overlay(self, frame: np.ndarray, processing_time: float) -> np.ndarray:
         """
         Draw status overlay on the frame.
         
         Args:
             frame: Input video frame
+            processing_time: Processing time in milliseconds
         
         Returns:
             Frame with status overlay
@@ -617,7 +766,7 @@ class FrameProcessor:
         fps_text = f"FPS: {self.fps:.1f}"
         detection_text = f"Detections: {self.detection_count}"
         tracking_text = f"Tracks: {self.tracking_count}"
-        time_text = f"Processing: {self.processing_time:.1f} ms"
+        time_text = f"Processing: {processing_time:.1f} ms"
         
         y_offset = 30
         cv2.putText(frame, fps_text, (10, y_offset), cv2.FONT_HERSHEY_SIMPLEX, 
@@ -744,7 +893,8 @@ class DisplayManager:
         self.register_key_callback(ord('5'), lambda: self.set_mode(DisplayMode.SPEED))
         self.register_key_callback(ord('6'), lambda: self.set_mode(DisplayMode.FLOW))
         self.register_key_callback(ord('7'), lambda: self.set_mode(DisplayMode.LICENSE_PLATE))
-        self.register_key_callback(ord('8'), lambda: self.set_mode(DisplayMode.COMPOSITE))
+        self.register_key_callback(ord('8'), lambda: self.set_mode(DisplayMode.TRAFFIC_LIGHTS))
+        self.register_key_callback(ord('9'), lambda: self.set_mode(DisplayMode.COMPOSITE))
         
         # Display options
         self.register_key_callback(ord('b'), lambda: self.toggle_config('show_boxes'))
@@ -755,6 +905,7 @@ class DisplayManager:
         self.register_key_callback(ord('s'), lambda: self.toggle_config('show_speed'))
         self.register_key_callback(ord('f'), lambda: self.toggle_config('show_flow'))
         self.register_key_callback(ord('p'), lambda: self.toggle_config('show_plates'))
+        self.register_key_callback(ord('g'), lambda: self.toggle_config('show_traffic_lights'))
         
         # Playback control
         self.register_key_callback(ord(' '), lambda: self.toggle_pause())
@@ -852,6 +1003,7 @@ class DisplayManager:
         speeds: Optional[Dict[int, float]] = None,
         plates: Optional[List[Any]] = None,
         flow_data: Optional[Any] = None,
+        traffic_lights: Optional[Dict[str, Any]] = None,
         processing_time: float = 0.0
     ):
         """
@@ -865,6 +1017,7 @@ class DisplayManager:
             speeds: Optional dictionary of vehicle_id -> speed
             plates: Optional list of license plate objects
             flow_data: Optional flow visualization data
+            traffic_lights: Optional traffic light states
             processing_time: Processing time in milliseconds
         """
         if not self.running:
@@ -890,7 +1043,7 @@ class DisplayManager:
         # Process frame
         start_time = time.time()
         processed_frame = self.processor.process_frame(
-            frame, self.mode, detections, tracks, zones, speeds, plates, flow_data
+            frame, self.mode, detections, tracks, zones, speeds, plates, flow_data, traffic_lights, processing_time
         )
         display_time = (time.time() - start_time) * 1000
         
