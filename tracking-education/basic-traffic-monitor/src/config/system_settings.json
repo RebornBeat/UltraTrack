@@ -275,6 +275,32 @@
       "cpu_threshold_percent": 90,
       "memory_threshold_percent": 85,
       "disk_threshold_percent": 90
+    },
+    "traffic_management": {
+      "enabled": true,
+      "intersections": [
+        {
+          "id": "main_intersection",
+          "lanes": 4,
+          "default_timings": {
+            "north_south_green": 30,
+            "east_west_green": 30,
+            "yellow_duration": 5,
+            "all_red_duration": 2
+          },
+          "optimization": {
+            "mode": "adaptive",
+            "min_green_time": 10,
+            "max_green_time": 90,
+            "extension_time": 5,
+            "vehicle_threshold": 5
+          }
+        }
+      ],
+      "simulation": {
+        "enabled": true,
+        "virtual_traffic": false
+      }
     }
   }
 }
